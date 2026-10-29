@@ -1,11 +1,1 @@
-
-{
-  description = "Versioned dotfiles for Home Manager";
-
-  outputs = { self }: {
-    homeManagerModules.dotfiles = { ... }: {
-      xdg.configFile."qtile".source = "${self}/qtile";
-        "${self}/alacritty/alacritty.toml";
-    };
-  };
-}
+{ description = "Selected Home Manager dotfiles"; outputs = { self }: { homeManagerModules.qtile = { ... }: { xdg.configFile."qtile".source = "${self}/qtile"; }; }; };

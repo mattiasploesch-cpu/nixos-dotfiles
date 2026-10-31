@@ -49,9 +49,8 @@ class DefaultConfigTest(unittest.TestCase):
             self.assertEqual(programs[name].requires, ("niri",))
             self.assertIn("DISPLAY", programs[name].unset_env)
         for name in ("discord", "spotify"):
-            self.assertEqual(
-                programs[name].env["ELECTRON_OZONE_PLATFORM_HINT"], "auto"
-            )
+            self.assertIn("--ozone-platform=wayland", programs[name].command)
+        self.assertIn("--disable-gpu", programs["spotify"].command)
 
     def test_unset_env_accepts_list_and_rejects_string(self) -> None:
         text = MINIMAL + '\n[programs.foo]\ncommand = ["foo"]\nunset_env = ["DISPLAY", "XAUTHORITY"]\n'
@@ -68,6 +67,60 @@ class DefaultConfigTest(unittest.TestCase):
         match = pattern.search("INFO niri: listening on Wayland socket: wayland-3")
         self.assertIsNotNone(match)
         self.assertEqual(match.group("socket"), "wayland-3")
+
+
+class CatalogTest(unittest.TestCase):
+    def test_catalog_ships_a_large_default_set(self) -> None:
+        config = parse_config(DEFAULT_CONFIG)
+        # Der Katalog soll ein komplettes Setup mitliefern, nicht nur die Basis.
+        self.assertGreaterEqual(len(config.programs), 40)
+        for name in (
+            "niri",
+            "dms",
+            "foot",
+            "alacritty",
+            "kitty",
+            "ghostty",
+            "firefox",
+            "chromium",
+            "discord",
+            "spotify",
+            "code",
+            "mpv",
+            "nautilus",
+            "fuzzel",
+            "waybar",
+        ):
+            self.assertIn(name, config.programs, name)
+
+    def test_catalog_warns_nothing_and_resolves_all_dependencies(self) -> None:
+        config = parse_config(DEFAULT_CONFIG)
+        self.assertEqual(config.warnings, [])
+        for entry in config.entries().values():
+            for dependency in entry.requires:
+                self.assertIn(dependency, config.entries())
+
+    def test_default_config_prefers_env_path(self) -> None:
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from weston_session.default_config import load_default_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            custom = Path(tmp) / "eigene.toml"
+            custom.write_text(
+                '[compositors.weston]\ncommand = ["weston"]\n', encoding="utf-8"
+            )
+            old = os.environ.get("RUN_WESTON_DEFAULT_CONFIG")
+            os.environ["RUN_WESTON_DEFAULT_CONFIG"] = str(custom)
+            try:
+                self.assertIn('command = ["weston"]', load_default_config())
+            finally:
+                if old is None:
+                    os.environ.pop("RUN_WESTON_DEFAULT_CONFIG", None)
+                else:
+                    os.environ["RUN_WESTON_DEFAULT_CONFIG"] = old
 
 
 class ConfigFileTest(unittest.TestCase):

@@ -75,6 +75,21 @@ eigene Datei.
 Systemkonfiguration aus `/etc/run_weston/config.toml`, und legt andernfalls
 die Standardkonfiguration an.
 
+Die Standardbelegung (rund 60 Wayland-Programme mit passenden Argumenten und
+Umgebungen) steht in `run_weston/default-config.toml`. Dieselbe Datei liefert
+das Paket aus und lesen die Module per `lib.importTOML` - es gibt also nur eine
+Quelle. Eigene Eintraege in `programs` ueberschreiben nur ihren Namen.
+
+### Sunshine-Audio (optional)
+
+```nix
+imports = [ inputs.dots.homeManagerModules.sunshine_audio ];
+services.sunshineAudio.enable = true;   # Sink "sunshine" + Loopback als User-Service
+```
+
+Der Service wird vom Modul aktiviert (kein Handstart). In
+`~/.config/sunshine/sunshine.conf` gehoert dazu `audio_sink = sunshine`.
+
 ## Start
 
 ```bash
@@ -227,5 +242,13 @@ wiederverwendet, nie beendet.
 - Weston 16 und Niri 26: das Logmuster fuer Niri ist konfigurierbar, weil
   Niri-Versionen unterschiedlich loggen; Fallback ist die Socket-Erkennung
   ueber offene Dateien des Prozesses.
+- Electron-Apps brauchen meist `--ozone-platform=wayland` (Spotify zusaetzlich
+  `--disable-gpu`): ohne das Flag weichen sie ohne `DISPLAY` auf X11 aus und
+  beenden sich still mit Exit 1, mit Flag scheitert im verschachtelten Weston
+  sonst der Chromium-GPU-Prozess.
+- Bei mehreren vorhandenen Sitzungen waehlt der Manager die zusammenpassende
+  Instanz: ein laufendes Niri bestimmt per `WAYLAND_DISPLAY` sein Weston, und
+  ein wiederverwendetes Niri muss auf dem gewaehlten Weston haengen. Sonst
+  warnt er explizit vor getrennten Desktops.
 - DMS ist nicht Teil von nixpkgs; es muss ueber `extraPackages` oder eine
   eigene Package-Quelle bereitgestellt werden.

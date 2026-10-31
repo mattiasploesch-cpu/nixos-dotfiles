@@ -19,10 +19,9 @@ stdenv.mkDerivation (finalAttrs: {
     find $out/lib -name '__pycache__' -type d -prune -exec rm -rf {} +
 
     install -m644 README.md $out/share/doc/run-weston/README.md
-
-    PYTHONPATH=$out/lib ${python3.interpreter} -c \
-      'from weston_session.default_config import DEFAULT_CONFIG; print(DEFAULT_CONFIG, end="")' \
-      > $out/share/run_weston/config.toml
+    # Eine Quelle fuer Python und Nix-Module: die TOML-Datei wird direkt
+    # ausgeliefert, nicht aus Python-Code erzeugt.
+    install -m644 default-config.toml $out/share/run_weston/config.toml
 
     makeWrapper ${python3.interpreter} $out/bin/run_weston \
       --add-flags "-m weston_session" \
@@ -36,7 +35,8 @@ stdenv.mkDerivation (finalAttrs: {
   installCheckPhase = ''
     runHook preInstallCheck
     $out/bin/run_weston --version
-    PYTHONPATH=$out/lib ${python3.interpreter} -c \
+    RUN_WESTON_DEFAULT_CONFIG=$out/share/run_weston/config.toml \
+      PYTHONPATH=$out/lib ${python3.interpreter} -c \
       'from weston_session.config import parse_config; from weston_session.default_config import DEFAULT_CONFIG; parse_config(DEFAULT_CONFIG)'
     runHook postInstallCheck
   '';

@@ -11,6 +11,11 @@ def _home() -> Path:
     return Path(os.environ.get("HOME", str(Path.home())))
 
 
+# Vom NixOS-Modul installierte Systemkonfiguration (Fallback, wenn der
+# Benutzer noch keine eigene config.toml hat).
+SYSTEM_CONFIG = Path("/etc/run_weston/config.toml")
+
+
 def _xdg(name: str, default: str) -> Path:
     value = os.environ.get(name)
     if value:
@@ -34,9 +39,14 @@ class Paths:
         state: str | os.PathLike[str] | None = None,
         runtime: str | os.PathLike[str] | None = None,
     ) -> "Paths":
-        config_path = Path(config).expanduser() if config else _xdg(
-            "XDG_CONFIG_HOME", ".config"
-        ) / "run_weston" / "config.toml"
+        if config:
+            config_path = Path(config).expanduser()
+        else:
+            config_path = (
+                _xdg("XDG_CONFIG_HOME", ".config") / "run_weston" / "config.toml"
+            )
+            if not config_path.exists() and SYSTEM_CONFIG.is_file():
+                config_path = SYSTEM_CONFIG
         state_home = Path(state).expanduser() if state else _xdg(
             "XDG_STATE_HOME", ".local/state"
         ) / "run_weston"

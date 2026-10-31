@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Mapping
+from typing import Iterable, Mapping
 
 # Variablen, die einen verschachtelten X11-Start nicht stoeren.
 BASE_KEYS = (
@@ -66,6 +66,7 @@ class EnvironmentManager:
         backend: str | None = None,
         wayland_display: str | None = None,
         extra_env: Mapping[str, str] | None = None,
+        unset_env: Iterable[str] | None = None,
     ) -> dict[str, str]:
         env = self.base()
         # Ein x11-Backend darf keinen geerbten Wayland-Socket sehen.
@@ -75,6 +76,11 @@ class EnvironmentManager:
             env["WAYLAND_DISPLAY"] = wayland_display
         else:
             env.pop("WAYLAND_DISPLAY", None)
+        # unset_env entfernt geerbte Variablen des Hosts (z. B. DISPLAY), damit
+        # ein Wayland-Programm nicht in der X11-Sitzung landet. Explizit
+        # gesetzte env-Werte haben Vorrang.
+        for key in unset_env or ():
+            env.pop(str(key), None)
         if extra_env:
             env.update({str(key): str(value) for key, value in extra_env.items()})
         env["XDG_RUNTIME_DIR"] = self.runtime_dir

@@ -14,6 +14,13 @@ DEFAULT_CONFIG = '''# run_weston - Weston Session Manager
 # startet alle Abhaengigkeiten rekursiv von unten nach oben, wartet auf deren
 # Bereitschaft und gibt erst danach die Umgebung an das naechste Programm
 # weiter. Zyklen werden beim Laden als Fehler gemeldet.
+#
+# Jeder Eintrag kann zusaetzlich:
+#   env       = { KEY = "wert" }   Umgebungsvariablen setzen
+#   unset_env = ["DISPLAY"]        vom Host geerbte Variablen entfernen
+# Fuer Programme, die im Compositor laufen sollen, ist unset_env = ["DISPLAY"]
+# wichtig: sonst wuerde z. B. Spotify das DISPLAY der X11-Sitzung (Qtile)
+# erben und auf dem Host statt in Weston/Niri erscheinen.
 
 [settings]
 # Compositor, den "run --env default ..." verwendet.
@@ -74,6 +81,34 @@ startup_timeout = 15
 command = ["foot"]
 requires = ["niri"]
 ready_check = "process"
+unset_env = ["DISPLAY"]
+
+[programs.alacritty]
+# Argumente sind frei konfigurierbar, z. B. eine eigene Konfigurationsdatei:
+#   command = ["alacritty", "--config-file", "/home/administrator/.config/alacritty/alacritty.toml"]
+command = ["alacritty"]
+requires = ["niri"]
+ready_check = "process"
+startup_timeout = 15
+unset_env = ["DISPLAY"]
+
+[programs.discord]
+command = ["discord"]
+requires = ["niri"]
+ready_check = "process"
+startup_timeout = 20
+# Electron: ohne DISPLAY und mit Wayland-Socket nutzt Discord Wayland.
+unset_env = ["DISPLAY"]
+env = { ELECTRON_OZONE_PLATFORM_HINT = "auto" }
+
+[programs.spotify]
+command = ["spotify"]
+requires = ["niri"]
+ready_check = "process"
+startup_timeout = 20
+# Siehe discord: verhindert den Start in der X11-Sitzung des Hosts.
+unset_env = ["DISPLAY"]
+env = { ELECTRON_OZONE_PLATFORM_HINT = "auto" }
 
 [programs.wayland-info]
 command = ["wayland-info"]
@@ -88,6 +123,8 @@ startup_timeout = 10
 # command = ["mein-programm", "--flag"]
 # requires = ["niri"]
 # ready_check = "process"
+# unset_env = ["DISPLAY"]
+# env = { MEINE_VARIABLE = "wert" }
 
 # ---------------------------------------------------------------------------
 # Unbekannte Programme

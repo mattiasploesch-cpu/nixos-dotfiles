@@ -42,6 +42,27 @@ class DefaultConfigTest(unittest.TestCase):
         self.assertEqual(config.programs["dms"].requires, ("niri",))
         self.assertEqual(config.programs["wayland-info"].ready_check, "exit")
 
+    def test_wayland_programs_do_not_inherit_host_display(self) -> None:
+        programs = parse_config(DEFAULT_CONFIG).programs
+        for name in ("discord", "spotify", "alacritty"):
+            self.assertIn(name, programs)
+            self.assertEqual(programs[name].requires, ("niri",))
+            self.assertIn("DISPLAY", programs[name].unset_env)
+        for name in ("discord", "spotify"):
+            self.assertEqual(
+                programs[name].env["ELECTRON_OZONE_PLATFORM_HINT"], "auto"
+            )
+
+    def test_unset_env_accepts_list_and_rejects_string(self) -> None:
+        text = MINIMAL + '\n[programs.foo]\ncommand = ["foo"]\nunset_env = ["DISPLAY", "XAUTHORITY"]\n'
+        self.assertEqual(
+            parse_config(text).programs["foo"].unset_env, ("DISPLAY", "XAUTHORITY")
+        )
+        broken = MINIMAL + '\n[programs.foo]\ncommand = ["foo"]\nunset_env = "DISPLAY"\n'
+        with self.assertRaises(ConfigError) as context:
+            parse_config(broken)
+        self.assertIn("unset_env", str(context.exception))
+
     def test_niri_ready_pattern_matches_log_line(self) -> None:
         pattern = re.compile(parse_config(DEFAULT_CONFIG).programs["niri"].ready_pattern)
         match = pattern.search("INFO niri: listening on Wayland socket: wayland-3")

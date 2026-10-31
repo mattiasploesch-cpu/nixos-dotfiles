@@ -19,6 +19,7 @@
         xdg.configFile."qtile".source = self + "/qtile";
       };
       change_bg = import ./modules/change_bg.nix;
+      neovim = import ./modules/neovim.nix { dotfiles = self; };
       run_weston = import ./modules/run_weston.nix;
       sunshine_audio = import ./modules/sunshine_audio.nix;
     };

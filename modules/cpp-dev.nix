@@ -11,6 +11,7 @@ let
     sdl3-ttf
     sdl3-mixer
     sdl3-net
+    sdl3-shadercross
 
     # Vulkan stack
     vulkan-headers
@@ -51,13 +52,27 @@ let
     valgrind
     ccache
   ];
+
+  # /run/current-system/sw only links the default output of a package. For
+  # these libraries the headers, the CMake config and the .pc file live in the
+  # dev/lib outputs, so they have to be collected into one environment
+  # explicitly. Without this, find_package(SDL3) fails even though sdl3 is
+  # listed in environment.systemPackages.
+  stack = pkgs.buildEnv {
+    name = "cpp-dev-stack";
+    paths = libs ++ tools;
+    extraOutputsToInstall = [ "out" "lib" "dev" "bin" ];
+    ignoreCollisions = true;
+  };
 in
 {
-  environment.systemPackages = libs ++ tools;
+  environment.systemPackages = [ stack ];
 
-  # CMake already derives /run/current-system/sw from the cmake binary, but
-  # setting the prefix explicitly keeps bundled CMake builds (CLion) working.
+  # Everything that resolves libraries at build time gets the stack prefix.
+  # CMAKE_PREFIX_PATH is inherited by terminals, Neovim and CLion alike.
   environment.sessionVariables = {
-    CMAKE_PREFIX_PATH = "/run/current-system/sw";
+    CMAKE_PREFIX_PATH = "${stack}";
+    PKG_CONFIG_PATH = "${stack}/lib/pkgconfig";
+    CMAKE_GENERATOR = "Ninja";
   };
 }

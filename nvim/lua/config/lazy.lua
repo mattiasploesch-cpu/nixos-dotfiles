@@ -14,7 +14,19 @@ if not (vim.uv or vim.loop).fs_stat(lazypath) then
 end
 vim.opt.rtp:prepend(lazypath)
 
+-- ~/.config/nvim is a read-only symlink into the Nix store, so lazy.nvim cannot
+-- write its lockfile there. Keep the mutable copy in the state directory and
+-- seed it once from the lockfile shipped with the configuration.
+local lockfile = vim.fn.stdpath("state") .. "/lazy-lock.json"
+local config_lockfile = vim.fn.stdpath("config") .. "/lazy-lock.json"
+local fs = vim.uv or vim.loop
+if not fs.fs_stat(lockfile) and fs.fs_stat(config_lockfile) then
+  vim.fn.mkdir(vim.fn.fnamemodify(lockfile, ":h"), "p")
+  vim.fn.writefile(vim.fn.readfile(config_lockfile), lockfile)
+end
+
 require("lazy").setup({
+  lockfile = lockfile,
   spec = {
     -- add LazyVim and import its plugins
     { "LazyVim/LazyVim", import = "lazyvim.plugins" },

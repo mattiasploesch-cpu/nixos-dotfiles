@@ -1,7 +1,7 @@
 return {
   "benomahony/uv.nvim",
   ft = { "python" },
-  depencies = {
+  dependencies = {
     "folke/snacks.nvim",
   },
   opts = {

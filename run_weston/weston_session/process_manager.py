@@ -61,6 +61,37 @@ def pid_alive(pid: int | None) -> bool:
     return True
 
 
+def exit_description(code: int | None) -> str:
+    """Lesbare Beschreibung eines Exit-Codes (Signale als Namen)."""
+    if code is None:
+        return "unbekannt"
+    if code < 0:
+        try:
+            name = signal.Signals(-code).name
+        except ValueError:
+            name = f"Signal {-code}"
+        return f"durch {name} beendet"
+    return f"Exit {code}"
+
+
+def group_alive(pgid: int | None) -> bool:
+    """Lebt noch ein Prozess in dieser Prozessgruppe?
+
+    Wrapper wie `bwrap` (Discord, Steam, ...) koennen sich beenden, waehrend die
+    eigentliche Anwendung in derselben Gruppe weiterlaeuft. Ohne diese Pruefung
+    meldet der Manager dann faelschlich FAILED.
+    """
+    if not pgid:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def process_identity_matches(pid: int | None, ticks: int | None) -> bool:
     if not pid_alive(pid):
         return False
@@ -109,7 +140,7 @@ class ManagedProcess:
             return process_identity_matches(self.pid, self.start_ticks)
         if self.popen is None:
             return False
-        return self.popen.poll() is None
+        return self.popen.poll() is None or group_alive(self.pgid)
 
     @property
     def wedged(self) -> bool:
@@ -313,8 +344,18 @@ class ProcessManager:
                         proc.status = RUNNING
                     continue
                 proc.exit_code = code
+                if code == 0 and group_alive(proc.pgid):
+                    # Der Launcher ist fertig, die App laeuft in seiner Gruppe
+                    # weiter (bwrap/fhsenv-Wrapper von Electron-Apps).
+                    if proc.status == STARTING:
+                        proc.status = RUNNING
+                    proc.message = (
+                        f"Launcher beendet ({exit_description(code)}), "
+                        "App laeuft weiter"
+                    )
+                    continue
                 proc.status = FAILED
-                proc.message = f"Prozess beendet (Exit {code})"
+                proc.message = f"beendet ({exit_description(code)})"
 
     # -- Bereitschaft ----------------------------------------------------
 
@@ -353,8 +394,13 @@ class ProcessManager:
             else:
                 if proc.popen is not None and proc.popen.poll() is not None:
                     code = proc.popen.poll()
-                    self.mark_failed(proc.key, f"Prozess beendet (Exit {code})", code)
-                    return False
+                    if not (code == 0 and group_alive(proc.pgid)):
+                        self.mark_failed(
+                            proc.key,
+                            f"beendet ({exit_description(code)})",
+                            code,
+                        )
+                        return False
 
                 if entry.ready_check == "socket":
                     candidate = (
@@ -407,7 +453,13 @@ class ProcessManager:
     def _ready_or_dead(self, proc: ManagedProcess) -> bool:
         if proc.popen is not None and proc.popen.poll() is not None:
             code = proc.popen.poll()
-            self.mark_failed(proc.key, f"sofort beendet (Exit {code})", code)
+            if code == 0 and group_alive(proc.pgid):
+                self.mark_ready(proc.key)
+                proc.message = "Launcher beendet, App laeuft weiter"
+                return True
+            self.mark_failed(
+                proc.key, f"sofort beendet ({exit_description(code)})", code
+            )
             return False
         self.mark_ready(proc.key)
         return True

@@ -26,6 +26,7 @@
 
     nixosModules = {
       run_weston = import ./modules/run_weston-nixos.nix;
+      cpp_dev = import ./modules/cpp-dev.nix;
     };
   };
 }

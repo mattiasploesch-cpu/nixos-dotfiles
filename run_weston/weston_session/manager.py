@@ -114,7 +114,23 @@ class SessionManager:
         return self.procs.rows()
 
     def tick(self) -> None:
+        """Status aktualisieren und Statuswechsel einmalig melden.
+
+        Ohne diese Meldung blieb ein extern beendeter Prozess stumm als FAILED
+        in der Liste stehen - ohne Exit-Code, Signal oder Logpfad.
+        """
+        before = {proc.name: proc.status for proc in self.procs.rows()}
         self.procs.poll()
+        for proc in self.procs.rows():
+            previous = before.get(proc.name)
+            if previous == proc.status:
+                continue
+            if proc.status == pm.FAILED:
+                self.emit(
+                    "error", f"{proc.name}: {proc.message} (Log: {proc.log_path})",
+                )
+            elif proc.status == pm.STOPPED:
+                self.emit("info", f"{proc.name}: {proc.message}")
 
     def active_display(self) -> str | None:
         """Display, auf dem neue Programme landen: die tiefste READY-Ebene.

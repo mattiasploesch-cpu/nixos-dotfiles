@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Startet run_weston direkt aus dem Repository (ohne Nix-Build).
+# Das Nix-Paket installiert stattdessen $out/bin/run_weston.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+root="$(dirname "$here")"
+
+export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
+exec "${PYTHON:-python3}" -m weston_session "$@"

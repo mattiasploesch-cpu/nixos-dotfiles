@@ -1,8 +1,8 @@
 # Uebersetzt die Moduloptionen in die TOML-Struktur von config.toml.
 #
-# Die Standardeintraege spiegeln run_weston/weston_session/default_config.py.
-# Eigene Eintraege kommen dazu bzw. ersetzen einen Standardeintrag mit
-# gleichem Namen; enable = false entfernt ihn.
+# Standardbelegung: run_weston/default-config.toml (dieselbe Datei, die das
+# Paket ausliefert). Eigene Eintraege kommen dazu bzw. ersetzen einen
+# Standardeintrag mit gleichem Namen; enable = false entfernt ihn.
 { lib }:
 
 cfg:
@@ -10,79 +10,41 @@ cfg:
 let
   inherit (lib) filterAttrs;
 
-  defaultCompositors = [
-    {
-      name = "weston";
-      command = [ "weston" "--backend=x11" "--socket=wayland-weston" ];
-      socket = "wayland-weston";
-      backend = "x11";
-      socketDetection = "cmdline";
-      readyCheck = "socket";
-      startupTimeout = 15;
-      stopOnExit = false;
-    }
-  ];
+  catalog = lib.importTOML ../run_weston/default-config.toml;
 
-  defaultPrograms = [
-    {
-      name = "niri";
-      command = [ "niri" ];
-      requires = [ "weston" ];
-      socketDetection = "log";
-      readyPattern = "listening on Wayland socket: (?P<socket>\\S+)";
-      readyCheck = "log";
-      startupTimeout = 20;
-    }
-    {
-      name = "dms";
-      command = [ "dms" "run" ];
-      requires = [ "niri" ];
-      readyCheck = "process";
-      startupTimeout = 15;
-    }
-    {
-      name = "foot";
-      command = [ "foot" ];
-      requires = [ "niri" ];
-      readyCheck = "process";
-      unsetEnv = [ "DISPLAY" ];
-    }
-    {
-      name = "alacritty";
-      command = [ "alacritty" ];
-      requires = [ "niri" ];
-      readyCheck = "process";
-      startupTimeout = 15;
-      unsetEnv = [ "DISPLAY" ];
-    }
-    {
-      name = "discord";
-      command = [ "discord" "--ozone-platform=wayland" ];
-      requires = [ "niri" ];
-      readyCheck = "process";
-      startupTimeout = 20;
-      unsetEnv = [ "DISPLAY" ];
-    }
-    {
-      name = "spotify";
-      # --disable-gpu: im verschachtelten Weston scheitert sonst der
-      # Chromium-GPU-Prozess ("GPU process isn't usable").
-      command = [ "spotify" "--ozone-platform=wayland" "--disable-gpu" ];
-      requires = [ "niri" ];
-      readyCheck = "process";
-      startupTimeout = 20;
-      unsetEnv = [ "DISPLAY" ];
-    }
-    {
-      name = "wayland-info";
-      command = [ "wayland-info" ];
-      requires = [ "weston" ];
-      readyCheck = "exit";
-      startupTimeout = 10;
-    }
-  ];
+  # TOML benutzt snake_case, die Moduloptionen camelCase.
+  rename = {
+    socket_detection = "socketDetection";
+    ready_check = "readyCheck";
+    ready_pattern = "readyPattern";
+    ready_command = "readyCommand";
+    startup_timeout = "startupTimeout";
+    stop_on_exit = "stopOnExit";
+    unset_env = "unsetEnv";
+  };
 
-  # Die Defaults oben sind absichtlich knapp; fehlende Felder bekommen hier
+  camelise =
+    attrs:
+    builtins.listToAttrs (
+      map
+        (
+          key:
+          {
+            name = rename.${key} or key;
+            value = attrs.${key};
+          }
+        )
+        (builtins.attrNames attrs)
+    );
+
+  fromCatalog =
+    table:
+    map (name: camelise (table.${name} // { inherit name; })) (builtins.attrNames table);
+
+  defaultCompositors = fromCatalog (catalog.compositors or { });
+  defaultPrograms = fromCatalog (catalog.programs or { });
+
+  # Die Katalogeintraege sind absichtlich knapp; fehlende Felder bekommen hier
   # dieselben Vorgaben wie in den Moduloptionen.
   normalise =
     item:

@@ -1,0 +1,460 @@
+# run_weston - Standardkonfiguration
+#
+# Diese Datei ist die einzige Quelle fuer die Standardbelegung:
+#   * das Nix-Paket installiert sie als share/run_weston/config.toml
+#   * die Nix-Module lesen sie per lib.importTOML
+#   * beim ersten Start wird sie nach ~/.config/run_weston/config.toml kopiert
+#
+# Regel: "requires" listet Namen (Compositoren oder Programme). Der Manager
+# startet alle Abhaengigkeiten rekursiv von unten nach oben, wartet auf deren
+# Bereitschaft und gibt erst danach die Umgebung an das naechste Programm
+# weiter. Zyklen werden beim Laden als Fehler gemeldet.
+#
+# Jeder Eintrag kann zusaetzlich:
+#   env       = { KEY = "wert" }   Umgebungsvariablen setzen
+#   unset_env = ["DISPLAY"]        vom Host geerbte Variablen entfernen
+# Fuer Programme, die im Compositor laufen sollen, ist unset_env = ["DISPLAY"]
+# wichtig: sonst wuerden sie das DISPLAY der X11-Sitzung (Qtile) erben und auf
+# dem Host statt in Weston/Niri erscheinen.
+#
+# Hinweis: Niri laeuft hier ohne Xwayland. Reine X11-Programme (rofi, xterm,
+# Steam im X11-Modus, ...) koennen deshalb nicht in der verschachtelten
+# Sitzung laufen und fehlen absichtlich.
+
+[settings]
+# Compositor, den "run --env default ..." verwendet.
+default_compositor = "weston"
+# Standard-Timeout in Sekunden, wenn ein Eintrag keinen eigenen angibt.
+startup_timeout = 15
+# Wie oft (Sekunden) Prozessstatus neu geprueft wird.
+health_check_interval = 1
+# Wartezeit zwischen SIGTERM und SIGKILL beim Beenden.
+kill_timeout = 5
+# Bereits laufende Instanzen (z. B. ein vorhandenes Weston) wiederverwenden.
+reuse_existing = true
+# Vom Manager gestartete Programme beim Beenden mitbeenden.
+# Einzelne Eintraege koennen das mit stop_on_exit = false ueberschreiben.
+stop_on_exit = true
+# Unbekannte Programme ohne "run --env" nicht blind ausfuehren.
+allow_unknown_programs = false
+
+# ---------------------------------------------------------------------------
+# Compositoren
+# ---------------------------------------------------------------------------
+
+[compositors.weston]
+# Weston laeuft verschachtelt in der X11-Sitzung: --backend=x11 ist Pflicht,
+# --backend=wayland wuerde eine nicht vorhandene Wayland-Sitzung voraussetzen.
+command = ["weston", "--backend=x11", "--socket=wayland-weston"]
+socket = "wayland-weston"
+backend = "x11"
+socket_detection = "cmdline"
+ready_check = "socket"
+startup_timeout = 15
+# Ein eigenes Weston ueberlebt das Beenden des Managers, damit die Sitzung
+# beim naechsten Start wiederverwendet werden kann.
+stop_on_exit = false
+
+# ---------------------------------------------------------------------------
+# Sitzungsbasis
+# ---------------------------------------------------------------------------
+
+[programs.niri]
+command = ["niri"]
+requires = ["weston"]
+# Niri legt seinen Socket selbst an; der Name ist nicht vorhersagbar.
+socket_detection = "log"
+ready_pattern = 'listening on Wayland socket: (?P<socket>\S+)'
+ready_check = "log"
+startup_timeout = 20
+
+[programs.dms]
+command = ["dms", "run"]
+requires = ["niri"]
+ready_check = "process"
+startup_timeout = 15
+
+# ---------------------------------------------------------------------------
+# Terminals und TUI-Werkzeuge (ueber ein Terminal gestartet)
+# ---------------------------------------------------------------------------
+
+[programs.foot]
+command = ["foot"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.alacritty]
+# Argumente sind frei konfigurierbar, z. B. eine eigene Konfigurationsdatei:
+#   command = ["alacritty", "--config-file", "/pfad/alacritty.toml"]
+command = ["alacritty"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.kitty]
+command = ["kitty"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.ghostty]
+command = ["ghostty"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.wezterm]
+command = ["wezterm"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.tmux]
+command = ["alacritty", "-e", "tmux"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.nvim]
+command = ["alacritty", "-e", "nvim"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.yazi]
+command = ["foot", "-e", "yazi"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.btop]
+command = ["foot", "-e", "btop"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+# ---------------------------------------------------------------------------
+# Diagnose und Systemwerkzeuge
+# ---------------------------------------------------------------------------
+
+[programs.wayland-info]
+command = ["wayland-info"]
+requires = ["weston"]
+# Diagnoseprogramm: gilt als erfolgreich, wenn es mit 0 beendet wird.
+ready_check = "exit"
+startup_timeout = 10
+
+[programs.niri-msg]
+command = ["niri", "msg", "version"]
+requires = ["niri"]
+ready_check = "exit"
+startup_timeout = 10
+
+[programs.grim]
+command = ["grim", "-t", "png", "/tmp/run-weston-grim.png"]
+requires = ["niri"]
+ready_check = "exit"
+startup_timeout = 10
+
+[programs.slurp]
+command = ["slurp"]
+requires = ["niri"]
+ready_check = "exit"
+startup_timeout = 20
+
+[programs.wf-recorder]
+command = ["wf-recorder", "-f", "/tmp/run-weston-aufnahme.mp4"]
+requires = ["niri"]
+ready_check = "process"
+
+[programs.brightnessctl]
+command = ["brightnessctl", "info"]
+requires = ["weston"]
+ready_check = "exit"
+
+[programs.playerctl]
+command = ["playerctl", "status"]
+requires = ["niri"]
+ready_check = "exit"
+
+# ---------------------------------------------------------------------------
+# Browser
+# ---------------------------------------------------------------------------
+
+[programs.firefox]
+command = ["firefox"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+env = { MOZ_ENABLE_WAYLAND = "1" }
+
+[programs.chromium]
+command = ["chromium", "--ozone-platform=wayland", "--enable-features=WaylandWindowDecorations"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.brave]
+command = ["brave", "--ozone-platform=wayland", "--enable-features=WaylandWindowDecorations"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.qutebrowser]
+command = ["qutebrowser"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+env = { QT_QPA_PLATFORM = "wayland" }
+
+[programs.thunderbird]
+command = ["thunderbird"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+env = { MOZ_ENABLE_WAYLAND = "1" }
+
+# ---------------------------------------------------------------------------
+# Electron / Qt-Clients (Chat, Musik, Editoren)
+# ---------------------------------------------------------------------------
+
+[programs.discord]
+# Ohne das Flag weicht Electron auf X11 aus (kein Xwayland -> Absturz).
+# --disable-gpu verhindert den GPU-Prozess-Absturz, den Spotify im
+# verschachtelten Weston ebenfalls zeigt.
+command = ["discord", "--ozone-platform=wayland", "--disable-gpu"]
+requires = ["niri"]
+startup_timeout = 25
+unset_env = ["DISPLAY"]
+
+[programs.spotify]
+# Ohne --ozone-platform=wayland beendet sich Spotify still mit Exit 1.
+command = ["spotify", "--ozone-platform=wayland", "--disable-gpu"]
+requires = ["niri"]
+startup_timeout = 25
+unset_env = ["DISPLAY"]
+
+[programs.code]
+command = ["code", "--ozone-platform=wayland", "--enable-features=WaylandWindowDecorations"]
+requires = ["niri"]
+startup_timeout = 25
+unset_env = ["DISPLAY"]
+
+[programs.obsidian]
+command = ["obsidian", "--ozone-platform=wayland"]
+requires = ["niri"]
+startup_timeout = 25
+unset_env = ["DISPLAY"]
+
+[programs.slack]
+command = ["slack", "--ozone-platform=wayland"]
+requires = ["niri"]
+startup_timeout = 25
+unset_env = ["DISPLAY"]
+
+[programs.signal-desktop]
+command = ["signal-desktop", "--ozone-platform=wayland"]
+requires = ["niri"]
+startup_timeout = 25
+unset_env = ["DISPLAY"]
+
+[programs.element-desktop]
+command = ["element-desktop", "--ozone-platform=wayland"]
+requires = ["niri"]
+startup_timeout = 25
+unset_env = ["DISPLAY"]
+
+[programs.zoom]
+command = ["zoom", "--ozone-platform=wayland"]
+requires = ["niri"]
+startup_timeout = 25
+unset_env = ["DISPLAY"]
+
+[programs.telegram-desktop]
+command = ["telegram-desktop"]
+requires = ["niri"]
+startup_timeout = 25
+unset_env = ["DISPLAY"]
+env = { QT_QPA_PLATFORM = "wayland" }
+
+[programs.keepassxc]
+command = ["keepassxc"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+env = { QT_QPA_PLATFORM = "wayland" }
+
+# ---------------------------------------------------------------------------
+# Media, Bilder, Dokumente
+# ---------------------------------------------------------------------------
+
+[programs.mpv]
+command = ["mpv", "--gpu-context=wayland"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.vlc]
+command = ["vlc"]
+requires = ["niri"]
+startup_timeout = 25
+unset_env = ["DISPLAY"]
+env = { QT_QPA_PLATFORM = "wayland" }
+
+[programs.celluloid]
+command = ["celluloid"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.imv]
+command = ["imv"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.loupe]
+command = ["loupe"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.zathura]
+command = ["zathura"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.okular]
+command = ["okular"]
+requires = ["niri"]
+startup_timeout = 25
+unset_env = ["DISPLAY"]
+env = { QT_QPA_PLATFORM = "wayland" }
+
+[programs.pavucontrol]
+command = ["pavucontrol"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.qpwgraph]
+command = ["qpwgraph"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+env = { QT_QPA_PLATFORM = "wayland" }
+
+[programs.helvum]
+command = ["helvum"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.obs]
+command = ["obs"]
+requires = ["niri"]
+startup_timeout = 30
+unset_env = ["DISPLAY"]
+env = { QT_QPA_PLATFORM = "wayland" }
+
+[programs.gimp]
+command = ["gimp"]
+requires = ["niri"]
+startup_timeout = 30
+unset_env = ["DISPLAY"]
+
+[programs.inkscape]
+command = ["inkscape"]
+requires = ["niri"]
+startup_timeout = 30
+unset_env = ["DISPLAY"]
+
+[programs.libreoffice]
+command = ["libreoffice"]
+requires = ["niri"]
+startup_timeout = 30
+unset_env = ["DISPLAY"]
+env = { SAL_USE_VCLPLUGIN = "gtk3" }
+
+# ---------------------------------------------------------------------------
+# Dateien und GNOME-Werkzeuge
+# ---------------------------------------------------------------------------
+
+[programs.nautilus]
+command = ["nautilus", "--new-window"]
+requires = ["niri"]
+startup_timeout = 25
+unset_env = ["DISPLAY"]
+
+[programs.dolphin]
+command = ["dolphin"]
+requires = ["niri"]
+startup_timeout = 25
+unset_env = ["DISPLAY"]
+env = { QT_QPA_PLATFORM = "wayland" }
+
+[programs.thunar]
+command = ["thunar"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.gnome-text-editor]
+command = ["gnome-text-editor"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.gnome-calculator]
+command = ["gnome-calculator"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.gnome-system-monitor]
+command = ["gnome-system-monitor"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.gnome-disk-utility]
+command = ["gnome-disk-utility"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.baobab]
+command = ["baobab"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.file-roller]
+command = ["file-roller"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+# ---------------------------------------------------------------------------
+# Desktop-Hilfen im Niri-Layer
+# ---------------------------------------------------------------------------
+
+[programs.fuzzel]
+command = ["fuzzel"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.wofi]
+command = ["wofi", "--show", "drun"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.mako]
+command = ["mako"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.swaync]
+command = ["swaync"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+[programs.waybar]
+command = ["waybar"]
+requires = ["niri"]
+unset_env = ["DISPLAY"]
+
+# ---------------------------------------------------------------------------
+# Spiele (Java/Wayland-faehig)
+# ---------------------------------------------------------------------------
+
+[programs.prismlauncher]
+command = ["prismlauncher"]
+requires = ["niri"]
+startup_timeout = 40
+unset_env = ["DISPLAY"]
+
+# ---------------------------------------------------------------------------
+# Unbekannte Programme
+# ---------------------------------------------------------------------------
+
+[unknown]
+# false: unbekannte Befehle werden abgelehnt (kein blindes Ausfuehren).
+# Erlaubt: "run --env niri mein-programm" nutzt eine definierte Umgebung.
+allow = false
+# Standard-Umgebung fuer "run --env default ..." und (falls allow = true)
+# fuer unbekannte Befehle.
+env = "niri"
+ready_check = "process"

@@ -1,71 +1,36 @@
 """Kanonische Standardkonfiguration fuer run_weston.
 
-Diese Datei ist die einzige Quelle fuer `config.toml`: sie wird beim ersten
-Start nach ~/.config/run_weston/config.toml geschrieben und vom Nix-Paket
-zusaetzlich als share/run_weston/config.toml ausgeliefert.
+Die grosse Programmliste steht in `default-config.toml` neben diesem Paket.
+Dieselbe Datei lesen die Nix-Module per `lib.importTOML`, damit es nur eine
+Quelle fuer die Standardbelegung gibt.
+
+Reihenfolge beim Laden:
+  1. `$RUN_WESTON_DEFAULT_CONFIG` (setzt das Nix-Paket)
+  2. `default-config.toml` neben diesem Modul (Repo-Betrieb)
+  3. eingebauter Minimalbestand, damit der Manager immer startfaehig ist
 """
 
-DEFAULT_CONFIG = '''# run_weston - Weston Session Manager
-#
-# Beim ersten Start wird diese Datei automatisch angelegt. Aenderungen werden
-# mit "reload" in der TUI neu eingelesen, ein Neustart ist nicht noetig.
-#
-# Regel: "requires" listet Namen (Compositoren oder Programme). Der Manager
-# startet alle Abhaengigkeiten rekursiv von unten nach oben, wartet auf deren
-# Bereitschaft und gibt erst danach die Umgebung an das naechste Programm
-# weiter. Zyklen werden beim Laden als Fehler gemeldet.
-#
-# Jeder Eintrag kann zusaetzlich:
-#   env       = { KEY = "wert" }   Umgebungsvariablen setzen
-#   unset_env = ["DISPLAY"]        vom Host geerbte Variablen entfernen
-# Fuer Programme, die im Compositor laufen sollen, ist unset_env = ["DISPLAY"]
-# wichtig: sonst wuerde z. B. Spotify das DISPLAY der X11-Sitzung (Qtile)
-# erben und auf dem Host statt in Weston/Niri erscheinen.
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+FALLBACK_CONFIG = '''# run_weston - Minimalbestand (default-config.toml nicht gefunden)
 
 [settings]
-# Compositor, den "run --env default ..." verwendet.
 default_compositor = "weston"
-# Standard-Timeout in Sekunden, wenn ein Eintrag keinen eigenen angibt.
 startup_timeout = 15
-# Wie oft (Sekunden) Prozessstatus neu geprueft wird.
-health_check_interval = 1
-# Wartezeit zwischen SIGTERM und SIGKILL beim Beenden.
-kill_timeout = 5
-# Bereits laufende Instanzen (z. B. ein vorhandenes Weston) wiederverwenden.
-reuse_existing = true
-# Vom Manager gestartete Programme beim Beenden mitbeenden.
-# Einzelne Eintraege koennen das mit stop_on_exit = false ueberschreiben.
-stop_on_exit = true
-# Unbekannte Programme ohne "run --env" nicht blind ausfuehren.
-allow_unknown_programs = false
-
-# ---------------------------------------------------------------------------
-# Compositoren
-# ---------------------------------------------------------------------------
 
 [compositors.weston]
-# Weston laeuft verschachtelt in der X11-Sitzung: --backend=x11 ist Pflicht,
-# --backend=wayland wuerde eine nicht vorhandene Wayland-Sitzung voraussetzen.
 command = ["weston", "--backend=x11", "--socket=wayland-weston"]
 socket = "wayland-weston"
 backend = "x11"
-# Socket aus der Kommandozeile bzw. den offenen Dateien des Prozesses lesen.
-socket_detection = "cmdline"
 ready_check = "socket"
-startup_timeout = 15
-# Ein eigenes Weston ueberlebt das Beenden des Managers, damit die Sitzung
-# beim naechsten Start wiederverwendet werden kann.
 stop_on_exit = false
-
-# ---------------------------------------------------------------------------
-# Programme
-# ---------------------------------------------------------------------------
 
 [programs.niri]
 command = ["niri"]
 requires = ["weston"]
-# Niri legt seinen Socket selbst an; der Name ist nicht vorhersagbar.
-# Deshalb wird er aus dem Log ermittelt (Fallback: offene Sockets des Prozesses).
 socket_detection = "log"
 ready_pattern = 'listening on Wayland socket: (?P<socket>\\S+)'
 ready_check = "log"
@@ -74,69 +39,36 @@ startup_timeout = 20
 [programs.dms]
 command = ["dms", "run"]
 requires = ["niri"]
-ready_check = "process"
-startup_timeout = 15
-
-[programs.foot]
-command = ["foot"]
-requires = ["niri"]
-ready_check = "process"
-unset_env = ["DISPLAY"]
-
-[programs.alacritty]
-# Argumente sind frei konfigurierbar, z. B. eine eigene Konfigurationsdatei:
-#   command = ["alacritty", "--config-file", "/home/administrator/.config/alacritty/alacritty.toml"]
-command = ["alacritty"]
-requires = ["niri"]
-ready_check = "process"
-startup_timeout = 15
-unset_env = ["DISPLAY"]
-
-[programs.discord]
-# Electron wertet ELECTRON_OZONE_PLATFORM_HINT hier nicht aus; ohne DISPLAY
-# wuerde Discord auf X11 ausweichen und abstuerzen. Das Flag erzwingt Wayland.
-command = ["discord", "--ozone-platform=wayland"]
-requires = ["niri"]
-ready_check = "process"
-startup_timeout = 20
-unset_env = ["DISPLAY"]
-
-[programs.spotify]
-# Ohne --ozone-platform=wayland beendet sich Spotify still mit Exit 1.
-# --disable-gpu verhindert "GPU process isn't usable" im verschachtelten
-# Weston (dort ist kein vollstaendiger GL-Stack garantiert).
-command = ["spotify", "--ozone-platform=wayland", "--disable-gpu"]
-requires = ["niri"]
-ready_check = "process"
-startup_timeout = 20
-unset_env = ["DISPLAY"]
-
-[programs.wayland-info]
-command = ["wayland-info"]
-requires = ["weston"]
-# Diagnoseprogramm: gilt als erfolgreich, wenn es mit 0 beendet wird.
-ready_check = "exit"
-startup_timeout = 10
-
-# Eigenes Programm hinzufuegen - einfach Block kopieren und anpassen.
-#
-# [programs.mein-programm]
-# command = ["mein-programm", "--flag"]
-# requires = ["niri"]
-# ready_check = "process"
-# unset_env = ["DISPLAY"]
-# env = { MEINE_VARIABLE = "wert" }
-
-# ---------------------------------------------------------------------------
-# Unbekannte Programme
-# ---------------------------------------------------------------------------
 
 [unknown]
-# false: unbekannte Befehle werden abgelehnt (kein blindes Ausfuehren).
-# Erlaubt: "run --env niri mein-programm" nutzt eine definierte Umgebung.
 allow = false
-# Standard-Umgebung fuer "run --env default ..." und (falls allow = true)
-# fuer unbekannte Befehle.
 env = "niri"
 ready_check = "process"
 '''
+
+
+def _candidates() -> list[Path]:
+    paths: list[Path] = []
+    from_env = os.environ.get("RUN_WESTON_DEFAULT_CONFIG")
+    if from_env:
+        paths.append(Path(from_env))
+    here = Path(__file__)
+    # Repo-Layout: run_weston/default-config.toml (ein Verzeichnis hoeher).
+    paths.append(here.parent / "default-config.toml")
+    paths.append(here.parent.parent / "default-config.toml")
+    return paths
+
+
+def load_default_config() -> str:
+    """Liest die Standardkonfiguration; faellt auf den Minimalbestand zurueck."""
+    for path in _candidates():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if text.strip():
+            return text
+    return FALLBACK_CONFIG
+
+
+DEFAULT_CONFIG = load_default_config()

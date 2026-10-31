@@ -20,6 +20,7 @@
       };
       change_bg = import ./modules/change_bg.nix;
       run_weston = import ./modules/run_weston.nix;
+      sunshine_audio = import ./modules/sunshine_audio.nix;
     };
 
     nixosModules = {

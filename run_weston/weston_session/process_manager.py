@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import re
 import signal
 import subprocess
@@ -174,6 +175,9 @@ class ProcessManager:
         self._order: list[str] = []
         self._log_offsets: dict[str, int] = {}
         self._lock = threading.RLock()
+        self._launch_queue: queue.Queue = queue.Queue()
+        self._launcher: threading.Thread | None = None
+        self._launcher_guard = threading.Lock()
 
     # -- Zugriff ---------------------------------------------------------
 
@@ -198,6 +202,78 @@ class ProcessManager:
 
     # -- Start -----------------------------------------------------------
 
+    def _ensure_launcher(self) -> None:
+        """Stellt sicher, dass der Launcher-Thread laeuft.
+
+        Kinder werden bewusst nur aus diesem einen, dauerhaft lebenden Thread
+        geforkt. Wrapper wie `bwrap --die-with-parent` (Discord, Steam, ...)
+        setzen `PR_SET_PDEATHSIG(SIGKILL)`; der Kernel stellt das Signal zu,
+        sobald der Thread endet, der das Kind geforkt hat - nicht erst beim
+        Prozessende. Startet die TUI eine App in einem Worker-Thread, der nach
+        dem Ready-Check fertig ist, wuerde die App also unmittelbar nach dem
+        Start sterben (scheinbarer Absturz, Exit -9).
+        """
+        with self._launcher_guard:
+            if self._launcher is not None and self._launcher.is_alive():
+                return
+            self._launcher = threading.Thread(
+                target=self._launch_loop,
+                name="run-weston-launcher",
+                daemon=True,
+            )
+            self._launcher.start()
+
+    def _launch_loop(self) -> None:
+        while True:
+            request = self._launch_queue.get()
+            if request is None:
+                return
+            entry, env, log_path, box = request
+            try:
+                popen = self._spawn(entry, env, log_path)
+                box["popen"] = popen
+            except RuntimeError as exc:
+                box["error"] = str(exc)
+            except Exception as exc:  # noqa: BLE001 - Thread darf nie sterben
+                box["error"] = f"{entry.name} konnte nicht gestartet werden: {exc}"
+            finally:
+                box["done"].set()
+
+    def _spawn(
+        self, entry: Entry, env: dict[str, str], log_path: Path
+    ) -> subprocess.Popen:
+        try:
+            handle = open(log_path, "wb")
+        except OSError as exc:
+            raise RuntimeError(
+                f"Logdatei {log_path} nicht schreibbar: {exc}"
+            ) from exc
+        try:
+            handle.write(
+                (
+                    f"# run_weston: {entry.name}\n# Befehl: {entry.command}\n"
+                    f"# XDG_RUNTIME_DIR={env.get('XDG_RUNTIME_DIR', '')}\n"
+                    f"# WAYLAND_DISPLAY={env.get('WAYLAND_DISPLAY', '')}\n"
+                ).encode()
+            )
+            handle.flush()
+            try:
+                return self._popen_factory(
+                    list(entry.command),
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"{entry.name} konnte nicht gestartet werden: {exc}"
+                ) from exc
+        finally:
+            handle.close()
+
     def start(self, entry: Entry, env: dict[str, str]) -> ManagedProcess:
         with self._lock:
             running = self.active(entry.name)
@@ -207,35 +283,17 @@ class ProcessManager:
                 )
             log_path = self.log_path_for(entry.name)
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                handle = open(log_path, "wb")
-            except OSError as exc:
-                raise RuntimeError(f"Logdatei {log_path} nicht schreibbar: {exc}") from exc
-            try:
-                handle.write(
-                    (
-                        f"# run_weston: {entry.name}\n# Befehl: {entry.command}\n"
-                        f"# XDG_RUNTIME_DIR={env.get('XDG_RUNTIME_DIR', '')}\n"
-                        f"# WAYLAND_DISPLAY={env.get('WAYLAND_DISPLAY', '')}\n"
-                    ).encode()
+            self._ensure_launcher()
+            box: dict = {"done": threading.Event(), "popen": None, "error": None}
+            self._launch_queue.put((entry, dict(env), log_path, box))
+            if not box["done"].wait(timeout=60):
+                raise RuntimeError(
+                    f"{entry.name} konnte nicht gestartet werden: "
+                    "Zeitueberschreitung beim Fork"
                 )
-                handle.flush()
-                try:
-                    popen = self._popen_factory(
-                        list(entry.command),
-                        env=env,
-                        stdin=subprocess.DEVNULL,
-                        stdout=handle,
-                        stderr=subprocess.STDOUT,
-                        start_new_session=True,
-                        close_fds=True,
-                    )
-                except (OSError, ValueError) as exc:
-                    raise RuntimeError(
-                        f"{entry.name} konnte nicht gestartet werden: {exc}"
-                    ) from exc
-            finally:
-                handle.close()
+            if box["error"]:
+                raise RuntimeError(box["error"])
+            popen = box["popen"]
 
             pgid = popen.pid
             try:

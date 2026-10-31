@@ -21,7 +21,28 @@ inputs.dots.url = "github:mattiasploesch-cpu/nixos-dotfiles";
 imports = [ inputs.dots.homeManagerModules.run_weston ];
 programs.runWeston = {
   enable = true;
-  extraPackages = with pkgs; [ weston niri foot ];
+  extraPackages = with pkgs; [ weston niri foot alacritty discord spotify ];
+
+  settings.startupTimeout = 20;
+
+  # Programme als Liste; name ist der Schluessel in der config.toml.
+  programs = [
+    {
+      name = "alacritty";
+      command = [ "alacritty" ];
+      requires = [ "niri" ];
+      readyCheck = "process";
+      unsetEnv = [ "DISPLAY" ];   # nicht in der X11-Sitzung des Hosts starten
+    }
+    {
+      name = "spotify";
+      command = [ "spotify" ];
+      requires = [ "niri" ];
+      startupTimeout = 25;
+      unsetEnv = [ "DISPLAY" ];
+      env.ELECTRON_OZONE_PLATFORM_HINT = "auto";
+    }
+  ];
 };
 
 # oder NixOS (configuration.nix)
@@ -39,10 +60,20 @@ environment.systemPackages = [ inputs.dots.packages.${pkgs.system}.run-weston ];
 # oder: nix run github:mattiasploesch-cpu/nixos-dotfiles
 ```
 
-Optionen: `enable`, `package`, `extraPackages`, `installConfig`, `configFile`.
-`installConfig = true` legt `config.toml` unter `~/.config/run_weston/`
-(Home-Manager) bzw. `/etc/run_weston/` (NixOS) ab; der Manager schreibt bei
-fehlender Datei automatisch die Standardkonfiguration.
+Optionen: `enable`, `package`, `extraPackages`, `installConfig`, `configFile`,
+`settings`, `compositors`, `programs` (Listen, siehe oben), `unknown`.
+
+Die `config.toml` wird aus diesen Optionen erzeugt (`pkgs.formats.toml`).
+Die Standardeintraege (weston; niri, dms, foot, alacritty, discord, spotify,
+wayland-info) sind immer enthalten, ein Eintrag mit gleichem `name` ersetzt sie,
+`enable = false` entfernt ihn. `configFile = ...` verwendet stattdessen eine
+eigene Datei.
+
+`installConfig = true` legt die Datei unter `~/.config/run_weston/`
+(Home-Manager) bzw. `/etc/run_weston/config.toml` (NixOS) ab. Der Manager nutzt
+`~/.config/run_weston/config.toml`, wenn sie existiert, sonst die
+Systemkonfiguration aus `/etc/run_weston/config.toml`, und legt andernfalls
+die Standardkonfiguration an.
 
 ## Start
 
@@ -136,8 +167,14 @@ Compositoren und Programme teilen sich ein Schema:
 | `ready_check` | `process`, `socket`, `log`, `command`, `exit` |
 | `ready_command` | Pflicht bei `ready_check = "command"` |
 | `startup_timeout` | Timeout in Sekunden |
-| `env` | zusaetzliche Umgebungsvariablen |
+| `env` | zusaetzliche Umgebungsvariablen (haben Vorrang vor `unset_env`) |
+| `unset_env` | geerbte Variablen entfernen, z. B. `["DISPLAY"]` |
 | `stop_on_exit` | ueberschreibt `[settings] stop_on_exit` |
+
+`unset_env = ["DISPLAY"]` ist fuer Wayland-Programme wichtig: der Manager erbt
+`DISPLAY=:0` von der X11-Sitzung, sonst wuerde z. B. Spotify (Electron) auf dem
+Host statt in Weston/Niri erscheinen. Mit entferntem `DISPLAY` und gesetztem
+`WAYLAND_DISPLAY` nutzen Spotify und Discord Wayland.
 
 Zyklische Abhaengigkeiten, unbekannte `requires`, ungueltige Werte und
 TOML-Syntaxfehler werden mit Position (Zeile) gemeldet; bei Fehlern startet der

@@ -78,9 +78,32 @@ class EnvironmentTest(unittest.TestCase):
     def test_base_environment_uses_runtime_dir(self) -> None:
         env = self.manager.base()
         self.assertEqual(env["XDG_RUNTIME_DIR"], "/run/user/1000")
+
+    def test_unset_env_removes_host_display(self) -> None:
+        env = self.manager.for_entry(
+            ["spotify"], wayland_display="wayland-niri", unset_env=("DISPLAY",)
+        )
+        self.assertNotIn("DISPLAY", env)
+        self.assertEqual(env["WAYLAND_DISPLAY"], "wayland-niri")
+
+    def test_x11_backend_drops_wayland_display(self) -> None:
+        env = self.manager.for_entry(
+            ["weston", "--backend=x11"],
+            backend="x11",
+            wayland_display="wayland-geerbt",
+        )
         self.assertEqual(env["DISPLAY"], ":0")
         self.assertNotIn("WAYLAND_DISPLAY", env)
         self.assertNotIn("UNWICHTIG", env)
+
+    def test_explicit_env_wins_over_unset_env(self) -> None:
+        env = self.manager.for_entry(
+            ["discord"],
+            wayland_display="wayland-niri",
+            unset_env=("DISPLAY",),
+            extra_env={"DISPLAY": ":9"},
+        )
+        self.assertEqual(env["DISPLAY"], ":9")
 
     def test_niri_gets_weston_socket(self) -> None:
         env = self.manager.for_entry(["niri"], wayland_display="wayland-weston")

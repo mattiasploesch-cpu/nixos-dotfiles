@@ -313,6 +313,7 @@ class SessionManager:
             backend=effective.backend,
             wayland_display=display,
             extra_env=effective.env,
+            unset_env=effective.unset_env,
         )
         try:
             proc = self.procs.start(effective, env)

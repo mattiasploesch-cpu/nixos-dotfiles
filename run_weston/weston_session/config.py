@@ -91,6 +91,7 @@ class Entry:
     ready_command: tuple[str, ...] | None = None
     startup_timeout: float | None = None
     env: Mapping[str, str] = field(default_factory=dict)
+    unset_env: tuple[str, ...] = ()
     stop_on_exit: bool | None = None
 
     @property
@@ -411,6 +412,31 @@ def _parse_entry(
                     continue
                 env[str(key)] = value
 
+    unset_env: tuple[str, ...] = ()
+    if "unset_env" in raw:
+        unset_raw = raw["unset_env"]
+        unset_hint = field_hint("unset_env")
+        if isinstance(unset_raw, str):
+            errors.append(
+                f"[{section}] unset_env: muss eine Liste sein, z. B. [\"DISPLAY\"]{unset_hint}"
+            )
+        elif not isinstance(unset_raw, list):
+            errors.append(
+                f"[{section}] unset_env: Liste von Variablennamen erwartet{unset_hint}"
+            )
+        else:
+            names: list[str] = []
+            for item in unset_raw:
+                if not isinstance(item, str) or not item.strip():
+                    errors.append(
+                        f"[{section}] unset_env: alle Eintraege muessen "
+                        f"Variablennamen sein{unset_hint}"
+                    )
+                    names = []
+                    break
+                names.append(item.strip())
+            unset_env = tuple(names)
+
     stop_on_exit = None
     if "stop_on_exit" in raw:
         stop_on_exit = _as_bool(
@@ -430,6 +456,7 @@ def _parse_entry(
         ready_command=ready_command,
         startup_timeout=startup_timeout,
         env=env,
+        unset_env=unset_env,
         stop_on_exit=stop_on_exit,
     )
 

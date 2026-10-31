@@ -77,7 +77,7 @@ class LayoutTest(unittest.TestCase):
     def test_status_text_contains_display(self) -> None:
         tui = Tui(StubManager())
         text = tui._status_text()
-        self.assertIn("ACTIVE DISPLAY: wayland-1", text)
+        self.assertIn("ANZEIGE: wayland-1", text)
         self.assertIn("PROZESSE: 1", text)
 
     def test_process_lines_mark_external_instances(self) -> None:

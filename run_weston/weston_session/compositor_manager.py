@@ -188,6 +188,23 @@ def discover_socket_for_pid(
     return found[0]
 
 
+def wayland_display_of(pid: int, proc_root: str | Path = "/proc") -> str | None:
+    """WAYLAND_DISPLAY aus /proc/<pid>/environ.
+
+    Zeigt, an welchem Compositor eine laufende Instanz haengt - damit laesst
+    sich eine fremde Sitzung (Weston A + Niri auf Weston B) erkennen.
+    """
+    try:
+        raw = Path(proc_root, str(pid), "environ").read_bytes()
+    except OSError:
+        return None
+    prefix = b"WAYLAND_DISPLAY="
+    for item in raw.split(b"\0"):
+        if item.startswith(prefix):
+            return item[len(prefix) :].decode("utf-8", "replace") or None
+    return None
+
+
 def replace_socket_arg(
     command: Sequence[str], old: str, new: str
 ) -> tuple[str, ...]:
@@ -287,16 +304,38 @@ def find_usable_instance(
     proc_root: str | Path = "/proc",
     uid: int | None = None,
     own_pid: int | None = None,
+    prefer_sockets: Iterable[str] = (),
+    prefer_wayland_display: str | None = None,
 ) -> ExistingInstance | None:
     """Erste laufende Instanz, deren Socket tatsaechlich verbindbar ist.
 
     Geprueft werden nur der ermittelte Socket des Prozesses und explizit
     erwartete Namen - niemals beliebige Sockets aus dem Runtime-Verzeichnis.
+
+    `prefer_sockets` und `prefer_wayland_display` sorgen dafuer, dass bei
+    mehreren Sitzungen die zusammenpassende gewaehlt wird: ein bereits
+    laufendes Niri zeigt per WAYLAND_DISPLAY auf "sein" Weston, und ein
+    wiederverwendetes Niri muss auf dem gewaehlten Weston haengen.
     """
     known = {name for name in socket_names if name}
-    for instance in find_running_instances(
+    preferred = {name for name in prefer_sockets if name}
+    instances = find_running_instances(
         executable, runtime_dir, proc_root=proc_root, uid=uid, own_pid=own_pid
-    ):
+    )
+    if preferred or prefer_wayland_display:
+        instances.sort(
+            key=lambda instance: (
+                0
+                if instance.socket in preferred
+                or (
+                    prefer_wayland_display is not None
+                    and wayland_display_of(instance.pid, proc_root)
+                    == prefer_wayland_display
+                )
+                else 1
+            )
+        )
+    for instance in instances:
         candidates: list[str] = []
         if instance.socket:
             candidates.append(instance.socket)

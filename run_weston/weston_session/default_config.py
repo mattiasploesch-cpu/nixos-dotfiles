@@ -93,22 +93,23 @@ startup_timeout = 15
 unset_env = ["DISPLAY"]
 
 [programs.discord]
-command = ["discord"]
+# Electron wertet ELECTRON_OZONE_PLATFORM_HINT hier nicht aus; ohne DISPLAY
+# wuerde Discord auf X11 ausweichen und abstuerzen. Das Flag erzwingt Wayland.
+command = ["discord", "--ozone-platform=wayland"]
 requires = ["niri"]
 ready_check = "process"
 startup_timeout = 20
-# Electron: ohne DISPLAY und mit Wayland-Socket nutzt Discord Wayland.
 unset_env = ["DISPLAY"]
-env = { ELECTRON_OZONE_PLATFORM_HINT = "auto" }
 
 [programs.spotify]
-command = ["spotify"]
+# Ohne --ozone-platform=wayland beendet sich Spotify still mit Exit 1.
+# --disable-gpu verhindert "GPU process isn't usable" im verschachtelten
+# Weston (dort ist kein vollstaendiger GL-Stack garantiert).
+command = ["spotify", "--ozone-platform=wayland", "--disable-gpu"]
 requires = ["niri"]
 ready_check = "process"
 startup_timeout = 20
-# Siehe discord: verhindert den Start in der X11-Sitzung des Hosts.
 unset_env = ["DISPLAY"]
-env = { ELECTRON_OZONE_PLATFORM_HINT = "auto" }
 
 [programs.wayland-info]
 command = ["wayland-info"]

@@ -49,9 +49,8 @@ class DefaultConfigTest(unittest.TestCase):
             self.assertEqual(programs[name].requires, ("niri",))
             self.assertIn("DISPLAY", programs[name].unset_env)
         for name in ("discord", "spotify"):
-            self.assertEqual(
-                programs[name].env["ELECTRON_OZONE_PLATFORM_HINT"], "auto"
-            )
+            self.assertIn("--ozone-platform=wayland", programs[name].command)
+        self.assertIn("--disable-gpu", programs["spotify"].command)
 
     def test_unset_env_accepts_list_and_rejects_string(self) -> None:
         text = MINIMAL + '\n[programs.foo]\ncommand = ["foo"]\nunset_env = ["DISPLAY", "XAUTHORITY"]\n'

@@ -227,5 +227,13 @@ wiederverwendet, nie beendet.
 - Weston 16 und Niri 26: das Logmuster fuer Niri ist konfigurierbar, weil
   Niri-Versionen unterschiedlich loggen; Fallback ist die Socket-Erkennung
   ueber offene Dateien des Prozesses.
+- Electron-Apps brauchen meist `--ozone-platform=wayland` (Spotify zusaetzlich
+  `--disable-gpu`): ohne das Flag weichen sie ohne `DISPLAY` auf X11 aus und
+  beenden sich still mit Exit 1, mit Flag scheitert im verschachtelten Weston
+  sonst der Chromium-GPU-Prozess.
+- Bei mehreren vorhandenen Sitzungen waehlt der Manager die zusammenpassende
+  Instanz: ein laufendes Niri bestimmt per `WAYLAND_DISPLAY` sein Weston, und
+  ein wiederverwendetes Niri muss auf dem gewaehlten Weston haengen. Sonst
+  warnt er explizit vor getrennten Desktops.
 - DMS ist nicht Teil von nixpkgs; es muss ueber `extraPackages` oder eine
   eigene Package-Quelle bereitgestellt werden.

@@ -252,9 +252,12 @@ class Tui:
         for name in ("weston", "niri"):
             if self.manager.config.entry(name) is not None:
                 proc = self.manager.procs.get(name)
-                parts.append(f"{name.upper()}: {proc.status if proc else '-'}")
+                state = proc.status if proc else "-"
+                if proc is not None and proc.socket:
+                    state += f" ({proc.socket})"
+                parts.append(f"{name.upper()}: {state}")
         display = self.manager.active_display()
-        parts.append(f"ACTIVE DISPLAY: {display or '-'}")
+        parts.append(f"ANZEIGE: {display or '-'}")
         parts.append(f"PROZESSE: {len(self.manager.rows())}")
         return "    ".join(parts)
 

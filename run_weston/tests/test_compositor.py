@@ -143,6 +143,43 @@ class SocketHelpersTest(unittest.TestCase):
         self.assertEqual(instances[0].pid, 5151)
         self.assertEqual(instances[0].socket, socket_name)
 
+    def test_wayland_display_of_reads_proc_environ(self) -> None:
+        pid = 8181
+        directory = fake_process(self.proc_root, pid, [self.name("fakecompositor")])
+        (directory / "environ").write_bytes(
+            b"PATH=/bin\0WAYLAND_DISPLAY=wayland-7\0DISPLAY=:0\0"
+        )
+        self.assertEqual(cm.wayland_display_of(pid, self.proc_root), "wayland-7")
+        self.assertIsNone(cm.wayland_display_of(9999, self.proc_root))
+
+    def test_find_usable_instance_prefers_matching_session(self) -> None:
+        executable = self.name("fakecompositor")
+        old_socket = self.name("wayland-old")
+        new_socket = self.name("wayland-new")
+        old_dir = fake_process(self.proc_root, 9191, [executable, f"--socket={old_socket}"])
+        fake_process(self.proc_root, 9292, [executable, f"--socket={new_socket}"])
+        (old_dir / "environ").write_bytes(b"WAYLAND_DISPLAY=:0\0")
+        old = self.listen(old_socket)
+        new = self.listen(new_socket)
+        try:
+            # Ohne Praeferenz gewinnt die neueste Instanz (hoechste PID).
+            default = cm.find_usable_instance(
+                executable, self.runtime, proc_root=self.proc_root, own_pid=-1
+            )
+            self.assertEqual(default.pid, 9292)
+            # Ein laufendes Kind, das auf dem alten Socket haengt, gewinnt.
+            preferred = cm.find_usable_instance(
+                executable,
+                self.runtime,
+                proc_root=self.proc_root,
+                own_pid=-1,
+                prefer_sockets=(old_socket,),
+            )
+            self.assertEqual(preferred.pid, 9191)
+        finally:
+            old.close()
+            new.close()
+
     def test_find_usable_instance_requires_connectable_socket(self) -> None:
         executable = self.name("fakecompositor")
         socket_name = self.name("wayland-usable")

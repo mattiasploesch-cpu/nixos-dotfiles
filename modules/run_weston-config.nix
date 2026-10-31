@@ -57,21 +57,21 @@ let
     }
     {
       name = "discord";
-      command = [ "discord" ];
+      command = [ "discord" "--ozone-platform=wayland" ];
       requires = [ "niri" ];
       readyCheck = "process";
       startupTimeout = 20;
       unsetEnv = [ "DISPLAY" ];
-      env = { ELECTRON_OZONE_PLATFORM_HINT = "auto"; };
     }
     {
       name = "spotify";
-      command = [ "spotify" ];
+      # --disable-gpu: im verschachtelten Weston scheitert sonst der
+      # Chromium-GPU-Prozess ("GPU process isn't usable").
+      command = [ "spotify" "--ozone-platform=wayland" "--disable-gpu" ];
       requires = [ "niri" ];
       readyCheck = "process";
       startupTimeout = 20;
       unsetEnv = [ "DISPLAY" ];
-      env = { ELECTRON_OZONE_PLATFORM_HINT = "auto"; };
     }
     {
       name = "wayland-info";

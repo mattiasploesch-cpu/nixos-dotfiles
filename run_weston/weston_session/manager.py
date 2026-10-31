@@ -117,10 +117,26 @@ class SessionManager:
         self.procs.poll()
 
     def active_display(self) -> str | None:
-        for proc in reversed(self.procs.rows()):
-            if proc.status == pm.READY and proc.socket:
-                return proc.socket
-        return None
+        """Display, auf dem neue Programme landen: die tiefste READY-Ebene.
+
+        Nicht einfach der zuletzt gestartete Prozess: nach dem Start von dms
+        bleibt der Socket von Niri der aktive, nicht der von Weston.
+        """
+        entries = self.config.entries()
+        best: tuple[int, str] | None = None
+        for proc in self.procs.rows():
+            if proc.status != pm.READY or not proc.socket:
+                continue
+            depth = self._depth(entries, proc.name)
+            if best is None or depth >= best[0]:
+                best = (depth, proc.socket)
+        return best[1] if best else None
+
+    def _depth(self, entries: dict[str, Entry], name: str) -> int:
+        entry = entries.get(name)
+        if entry is None or not entry.requires:
+            return 0
+        return 1 + max(self._depth(entries, dependency) for dependency in entry.requires)
 
     def completion_candidates(self) -> list[str]:
         base = [
@@ -284,16 +300,59 @@ class SessionManager:
             return True
         return entry.socket is not None or entry.ready_check in ("socket", "log")
 
+    def _child_displays(self, entry: Entry) -> dict[str, str]:
+        """Laufende Programme, die bereits auf diesem Compositor haengen.
+
+        Deren WAYLAND_DISPLAY ist der Socket des Compositors, den sie benutzen
+        (z. B. Niri -> wayland-weston). So laesst sich die passende Instanz
+        waehlen, statt sich auf die neueste PID zu verlassen.
+        """
+        displays: dict[str, str] = {}
+        for child in self.config.entries().values():
+            if entry.name not in child.requires:
+                continue
+            for instance in compositors.find_running_instances(
+                child.command[0], self.paths.runtime, proc_root=self.proc_root
+            ):
+                display = compositors.wayland_display_of(instance.pid, self.proc_root)
+                if display:
+                    displays[child.name] = display
+                    break
+        return displays
+
     def _find_existing(self, entry: Entry) -> compositors.ExistingInstance | None:
         if not self._is_reusable(entry):
             return None
         socket_names = [entry.socket] if entry.socket else []
+        prefer_sockets: tuple[str, ...] = ()
+        prefer_display = None
+        if entry.is_compositor:
+            prefer_sockets = tuple(self._child_displays(entry).values())
+        else:
+            prefer_display = self._parent_display(entry)
         return compositors.find_usable_instance(
             entry.command[0],
             self.paths.runtime,
             socket_names=socket_names,
             proc_root=self.proc_root,
+            prefer_sockets=prefer_sockets,
+            prefer_wayland_display=prefer_display,
         )
+
+    def _check_display_consistency(self, entry: Entry) -> None:
+        """Warnt, wenn ein Kind auf einem anderen Compositor laeuft."""
+        if not entry.is_compositor:
+            return
+        proc = self.procs.get(entry.name)
+        if proc is None or not proc.socket:
+            return
+        for child, display in self._child_displays(entry).items():
+            if display != proc.socket:
+                self.emit(
+                    "warn",
+                    f"{child} laeuft auf {display}, {entry.name} auf {proc.socket} - "
+                    "das sind getrennte Desktops",
+                )
 
     def _launch(self, entry: Entry) -> bool:
         existing = self._find_existing(entry)
@@ -304,6 +363,7 @@ class SessionManager:
                 f"{entry.name}: laufende Instanz wird wiederverwendet "
                 f"(PID {existing.pid}, Socket {existing.socket or 'unbekannt'})",
             )
+            self._check_display_consistency(entry)
             return True
 
         effective = self._effective_entry(entry)
@@ -331,6 +391,7 @@ class SessionManager:
         if ok:
             detail = f", Socket {proc.socket}" if proc.socket else ""
             self.emit("ok", f"{entry.name} ist bereit{detail}")
+            self._check_display_consistency(entry)
             self.save_state()
         else:
             self.emit(

@@ -282,9 +282,15 @@ pick_image() {
   done
 }
 
-apply_block() {
-  local block="$1"
+nix_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\${/\\${/g'
+}
+
+apply_blocks() {
+  local session_block="$1"
+  local activation_block="$2"
   local tmp_cfg="$tmpdir/config"
+  local tmp_inserted="$tmpdir/config.inserted"
   local tmp_final="$tmpdir/config.new"
 
   cp "$config_file" "$tmp_cfg"
@@ -307,11 +313,44 @@ apply_block() {
     return 1
   fi
 
-  # Marker-Block durch die neue Auswahl ersetzen.
-  awk -v blockfile="$block" '
+  # Einmalig den Activation-Block vor der letzten schließenden Klammer einfügen.
+  if ! grep -q '# >>> change_bg_activation >>>' "$tmp_cfg"; then
+    awk -v blockfile="$activation_block" '
+      { lines[NR] = $0 }
+      END {
+        last = 0
+        for (i = 1; i <= NR; i++)
+          if (lines[i] ~ /^[[:space:]]*}[[:space:]]*$/) last = i
+        if (last == 0) {
+          print "change_bg: Konnte das Ende des Moduls in configuration.nix nicht finden." > "/dev/stderr"
+          exit 1
+        }
+        for (i = 1; i < last; i++) print lines[i]
+        while ((getline line < blockfile) > 0) print line
+        close(blockfile)
+        for (i = last; i <= NR; i++) print lines[i]
+      }
+    ' "$tmp_cfg" > "$tmp_inserted" || return 1
+    mv "$tmp_inserted" "$tmp_cfg"
+  fi
+
+  if ! grep -q '# <<< change_bg_activation <<<' "$tmp_cfg"; then
+    echo "Fehler: change_bg-Activation-Marker in $config_file sind unvollständig." >&2
+    return 1
+  fi
+
+  # Beide Marker-Blöcke durch die neue Auswahl ersetzen.
+  awk -v sblock="$session_block" -v ablock="$activation_block" '
+    /# >>> change_bg_activation >>>/ {
+      while ((getline line < ablock) > 0) print line
+      close(ablock)
+      skip = 1
+      next
+    }
+    /# <<< change_bg_activation <<</ { skip = 0; next }
     /# >>> change_bg >>>/ {
-      while ((getline line < blockfile) > 0) print line
-      close(blockfile)
+      while ((getline line < sblock) > 0) print line
+      close(sblock)
       skip = 1
       next
     }

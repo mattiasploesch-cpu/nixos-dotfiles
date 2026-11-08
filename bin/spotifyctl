@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""spotifyctl - Spotify im Terminal (Wiedergabe laeuft ueber librespot).
+
+Tokens werden NICHT mehr angegeben: tokenstore holt/erneuert sie selbst
+(Cache -> OAuth-Refresh -> Live-Capture -> Browser-Login).
+
+Beispiele:
+  spotifyctl play "daft punk"     # suchen und abspielen
+  spotifyctl pause | resume | next | prev | stop
+  spotifyctl vol 40 | seek 1:23
+  spotifyctl status | now
+  spotifyctl search "text"
+  spotifyctl liked | playlists | playlist <id|url> | top | recent | queue
+  spotifyctl devices | transfer
+  spotifyctl login                # nur falls mal ein neuer Login noetig ist
+"""
+
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.path.expanduser("~/.local/share/mimic"))
+import tokenstore  # noqa: E402
+from tokenstore import TokenError  # noqa: E402
+
+TOKEN_NAME = "spotify"
+DEVICE_NAME = os.environ.get("SPOTIFY_DEVICE", "Matthias-PC")
+DEVICE_FILE = os.path.expanduser("~/.config/mimic/spotify-device-id")
+STATE_FILE = os.path.expanduser("~/.cache/librespot/state.json")
+
+# HTTP ohne Proxy (der mimic-Proxy soll nicht alles mitschneiden)
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+OFF = "\033[0m"
+
+
+def die(msg: str) -> "None":
+    print(f"{RED}Fehler:{OFF} {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------- HTTP-Helfer
+def api(method, path, token=None, data=None, base="https://api.spotify.com/v1", raw=False):
+    url = path if path.startswith("http") else base + path
+    body = json.dumps(data).encode() if data is not None else None
+    req = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Accept", "application/json")
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    try:
+        with _OPENER.open(req, timeout=30) as r:
+            payload = r.read()
+            if raw or not payload:
+                return r.status, None
+            try:
+                return r.status, json.loads(payload)
+            except json.JSONDecodeError:
+                return r.status, payload.decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        payload = e.read()
+        try:
+            err = json.loads(payload).get("error", {})
+            msg = err.get("message", payload[:200]) if isinstance(err, dict) else str(err)
+        except Exception:
+            msg = payload[:200]
+        return e.code, msg
+
+
+def _try(method, path, data=None, ok=(200, 201, 202, 204), **kw):
+    """Alle Tokens durchprobieren. Gibt (status, body) zurueck."""
+    tried = set()
+    last = (0, "kein Token verfuegbar")
+    for label in ("app", "app-neu", "login"):
+        if label == "app":
+            token = tokenstore.get_capture(TOKEN_NAME)
+        elif label == "app-neu":
+            token = tokenstore.get_capture(TOKEN_NAME, ttl=0)
+        else:
+            try:
+                token = tokenstore.get_token(TOKEN_NAME, prefer="oauth")
+            except TokenError:
+                continue
+        if not token or token in tried:
+            continue
+        tried.add(token)
+        for attempt in (1, 2):
+            status, body = api(method, path, token=token, data=data, **kw)
+            if status == 429 and attempt == 1:      # kurzes Bucket -> einmal warten
+                time.sleep(int(os.environ.get("SPOTIFY_RETRY_WAIT", "4")))
+                continue
+            break
+        if status in ok:
+            return status, body
+        last = (status, body, label)
+        if status not in (401, 403, 404, 429):
+            return status, body
+    return last[0], last[1]
+
+
+def call(method, path, data=None, ok=(200, 201, 202, 204), soft=False, **kw):
+    """API-Aufruf — Tokens werden automatisch geholt und durchprobiert.
+
+    1. App-Token aus dem Capture (schnell, eigenes Rate-Limit)
+    2. frischer App-Token (falls der gespeicherte abgelaufen ist)
+    3. Login-Token (voller Zugriff, wird bei Bedarf automatisch erneuert)
+    """
+    status, body = _try(method, path, data=data, ok=ok, **kw)
+    if status in ok:
+        return body
+    if status in (401, 403) and os.environ.get("MIMIC_TOKEN_AUTO_LOGIN", "1") != "0":
+        print(f"{YELLOW}Braucht einen Login-Token — starte Browser-Login …{OFF}", file=sys.stderr)
+        try:
+            status, body = api(method, path, token=tokenstore.login(TOKEN_NAME), data=data, **kw)
+            if status in ok:
+                return body
+        except TokenError as e:
+            if not soft:
+                die(str(e))
+    if soft:
+        return None
+    if status in (404, 429):
+        print(f"{DIM}Hinweis: Lesezugriffe sind mit dem App-Token eingeschraenkt (404), und der "
+              f"Login-Token ist oft rate-limitiert (429).\nEigene Spotify-Client-ID einrichten: "
+              f"~/.local/share/mimic/README.md — oder lokal nachsehen: spotifyctl status{OFF}",
+              file=sys.stderr)
+    die(f"HTTP {status} bei {method} {path}: {body}")
+
+
+# ------------------------------------------------------------------ Ausgabe
+def ms(msv):
+    s = int((msv or 0) / 1000)
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def fmt_track(t, prefix=""):
+    if not t:
+        return
+    artists = ", ".join(a["name"] for a in t.get("artists", []))
+    alb = (t.get("album") or {}).get("name", "")
+    print(f"{prefix}{BOLD}{t.get('name')}{OFF} — {artists}  {DIM}[{alb}] {ms(t.get('duration_ms'))}{OFF}")
+
+
+def save_device_id(did):
+    try:
+        os.makedirs(os.path.dirname(DEVICE_FILE), exist_ok=True)
+        with open(DEVICE_FILE, "w") as fh:
+            fh.write(did + "\n")
+        os.chmod(DEVICE_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def device_id(learn=True):
+    """Device-ID von librespot (stabil) - aus Env/Datei, sonst einmalig per API lernen."""
+    did = os.environ.get("SPOTIFY_DEVICE_ID")
+    if not did:
+        try:
+            with open(DEVICE_FILE) as fh:
+                did = fh.read().strip()
+        except OSError:
+            did = ""
+    if did:
+        return did
+    if not learn:
+        return None
+    d = call("GET", "/me/player/devices", soft=True)
+    for dev in (d or {}).get("devices", []):
+        if DEVICE_NAME.lower() in dev["name"].lower():
+            save_device_id(dev["id"])
+            return dev["id"]
+    return None
+
+
+def ensure_device(autostart=True):
+    """Wiedergabe auf 'Matthias-PC' umschalten. Gibt die Device-ID zurueck (oder None)."""
+    did = device_id()
+    if not did:
+        print(f"{YELLOW}Kein Geraet bekannt — Wiedergabe laeuft auf dem aktiven Geraet.{OFF}\n"
+              f"{DIM}Einmal '{DEVICE_NAME}' in der Spotify-App auswaehlen, dann merkt es sich das.{OFF}",
+              file=sys.stderr)
+        return None
+    status, _ = _try("PUT", "/me/player", data={"device_ids": [did]})
+    if status not in (200, 202, 204):
+        print(f"{YELLOW}{DEVICE_NAME} nicht erreichbar (HTTP {status}) — laeuft librespot?{OFF}",
+              file=sys.stderr)
+    time.sleep(0.5)
+    return did
+
+
+# ------------------------------------------------------------------ Befehle
+def _play_url(did):
+    return "/me/player/play" + (f"?device_id={did}" if did else "")
+
+
+def cmd_devices():
+    d = call("GET", "/me/player/devices", soft=True)
+    if d is None:
+        did = device_id(learn=False)
+        print(f"{YELLOW}Geraeteliste nicht abrufbar (Rate-Limit des Login-Tokens).{OFF}")
+        print(f"  bekannt:  {BOLD}{DEVICE_NAME}{OFF}  {DIM}{did or '?'}{OFF}")
+        print(f"  {DIM}Tipp: Geräte siehst du in der Spotify-App unten links (Connect).{OFF}")
+        return
+    for dev in d.get("devices", []):
+        mark = f"{GREEN}●{OFF}" if dev.get("is_active") else " "
+        print(f" {mark} {BOLD}{dev['name']}{OFF}  {DIM}{dev['type']}, vol {dev.get('volume_percent')}%{OFF}")
+
+
+def cmd_transfer(args):
+    did = device_id(learn=bool(args))
+    if args:
+        d = call("GET", "/me/player/devices", soft=True) or {}
+        for dev in d.get("devices", []):
+            if args[0].lower() in dev["name"].lower():
+                did = dev["id"]
+                save_device_id(did)
+    if not did:
+        die("Kein Geraet bekannt (Name aus der Spotify-App oder Datei "
+            f"{DEVICE_FILE} setzen).")
+    call("PUT", "/me/player", {"device_ids": [did]})
+    print(f"Wiedergabe -> {BOLD}{DEVICE_NAME}{OFF}")
+
+
+def cmd_play(args):
+    did = ensure_device()
+    if not args:
+        call("PUT", _play_url(did))
+        print(f"{GREEN}▶{OFF} Weiter")
+        return
+    q = " ".join(args)
+    if q.startswith("spotify:"):
+        call("PUT", _play_url(did), {"uris": [q]})
+        print(f"{GREEN}▶{OFF} {q}")
+        return
+    r = call("GET", "/search?" + urllib.parse.urlencode({"q": q, "type": "track", "limit": 1})) or {}
+    items = r.get("tracks", {}).get("items", [])
+    if not items:
+        die(f"Nichts gefunden fuer '{q}'")
+    t = items[0]
+    album = (t.get("album") or {}).get("uri")
+    if album:
+        # Album als Kontext -> Wiedergabe laeuft nach dem Track weiter
+        status, _ = _try("PUT", _play_url(did),
+                         data={"context_uri": album, "offset": {"uri": t["uri"]}})
+        if status in (200, 202, 204):
+            print(f"{GREEN}▶{OFF} ", end="")
+            fmt_track(t)
+            print(f"  {DIM}(Album: {t['album']['name']}){OFF}")
+            return
+    call("PUT", _play_url(did), {"uris": [t["uri"]]})
+    print(f"{GREEN}▶{OFF} ", end="")
+    fmt_track(t)
+
+
+def cmd_search(args):
+    if not args:
+        die("Benutzung: spotifyctl search <text>")
+    r = call("GET", "/search?" + urllib.parse.urlencode(
+        {"q": " ".join(args), "limit": "8", "type": "track,album,artist,playlist"})) or {}
+    for key, label in (("tracks", "Tracks"), ("artists", "Kuenstler"),
+                       ("albums", "Alben"), ("playlists", "Playlists")):
+        items = (r.get(key) or {}).get("items") or []
+        if items:
+            print(f"{BOLD}{label}:{OFF}")
+            for i, it in enumerate(items, 1):
+                if key == "tracks":
+                    print(f"  {i}. {it['name']} — " + ", ".join(a["name"] for a in it["artists"]))
+                else:
+                    print(f"  {i}. {it['name']}")
+            print()
+    print(f'{DIM}Abspielen:  spotifyctl play "<suche>"{OFF}')
+
+
+def _vol_percent(raw):
+    """librespot liefert die Lautstaerke auf der Skala 0..65535."""
+    try:
+        raw = int(raw or 0)
+    except (TypeError, ValueError):
+        return None
+    return round(raw / 655.35) if raw else None
+
+
+def _status_local():
+    """Status aus librespot's lokaler Zustandsdatei (kein API-Zugriff, kein Limit)."""
+    try:
+        with open(STATE_FILE) as fh:
+            s = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        print("Kein Status verfuegbar (spielt gerade nichts).")
+        return None
+    if not s.get("name"):
+        print("Noch kein Titel bekannt (seit librespot laeuft nichts gespielt).")
+        return None
+    pos = s.get("position_ms") or 0
+    if s.get("playing") and s.get("updated"):
+        pos += int((time.time() - s["updated"]) * 1000)
+    vol = _vol_percent(s.get("volume"))
+    icon = "▶" if s.get("playing") else "⏸"
+    print(f"{icon} {BOLD}{s.get('name')}{OFF} — {s.get('artists', '')}")
+    print(f"  {DIM}{s.get('album', '')}{OFF}")
+    print(f"  {ms(pos)}  |  {DEVICE_NAME}  |  vol {vol if vol is not None else '?'}%"
+          f"  {DIM}(lokal, ohne API){OFF}")
+    return s
+
+
+def cmd_status(verbose=True):
+    p = call("GET", "/me/player", soft=True)
+    if p is None:
+        return _status_local()
+    if not p.get("item"):
+        print("Nichts aktiv.")
+        return p
+    t = p["item"]
+    dev = p.get("device", {})
+    print(f"{'▶' if p.get('is_playing') else '⏸'} {BOLD}{t['name']}{OFF} — "
+          f"{', '.join(a['name'] for a in t.get('artists', []))}")
+    print(f"  {DIM}{t.get('album', {}).get('name', '')}{OFF}")
+    print(f"  {ms(p.get('progress_ms'))} / {ms(t.get('duration_ms'))}  |  "
+          f"{dev.get('name')}  |  vol {dev.get('volume_percent')}%"
+          f"  |  shuffle {'an' if p.get('shuffle_state') else 'aus'}  |  repeat {p.get('repeat_state')}")
+    if verbose:
+        print(f"  {DIM}{t.get('external_urls', {}).get('spotify', '')}{OFF}")
+    return p
+
+
+def cmd_pause():
+    call("PUT", "/me/player/pause")
+    print("⏸ Pause")
+
+
+def cmd_resume():
+    ensure_device()
+    call("PUT", "/me/player/play")
+    print("▶ Play")
+
+
+def cmd_next():
+    call("POST", "/me/player/next")
+    time.sleep(0.7)
+    cmd_status(verbose=False)
+
+
+def cmd_prev():
+    call("POST", "/me/player/previous")
+    time.sleep(0.7)
+    cmd_status(verbose=False)
+
+
+def cmd_vol(args):
+    if not args:
+        p = call("GET", "/me/player", soft=True) or {}
+        vol = (p.get("device") or {}).get("volume_percent")
+        if vol is None:
+            try:
+                with open(STATE_FILE) as fh:
+                    vol = _vol_percent(json.load(fh).get("volume"))
+            except (OSError, json.JSONDecodeError):
+                vol = None
+        print(f"vol {vol if vol is not None else '?'}%")
+        return
+    call("PUT", f"/me/player/volume?volume_percent={int(args[0])}")
+    print(f"vol {args[0]}%")
+
+
+def cmd_seek(args):
+    if not args:
+        die("Benutzung: spotifyctl seek 1:23  (oder Millisekunden)")
+    a = args[0]
+    pos = int(a) if a.isdigit() else (lambda m: int(m[0]) * 60000 + int(m[1]) * 1000)(a.split(":"))
+    call("PUT", f"/me/player/seek?position_ms={pos}")
+    print(f"seek {a}")
+
+
+def cmd_like(args):
+    p = call("GET", "/me/player") or {}
+    t = p.get("item")
+    if not t:
+        die("Nichts spielt.")
+    if args and args[0] == "del":
+        call("DELETE", "/me/tracks", {"ids": [t["id"]]}, ok=(200, 204))
+        print(f"👎 {t['name']} entfernt")
+    else:
+        call("PUT", "/me/tracks", {"ids": [t["id"]]})
+        print(f"❤ {t['name']} in Liked Songs")
+
+
+def cmd_liked(args):
+    n = int(args[0]) if args else 20
+    r = call("GET", f"/me/tracks?limit={n}") or {}
+    for i, it in enumerate(r.get("items", []), 1):
+        fmt_track(it["track"], prefix=f"  {i:2d}. ")
+
+
+def cmd_playlists(args):
+    r = call("GET", "/me/playlists?limit=50") or {}
+    for i, p in enumerate(r.get("items", []), 1):
+        print(f"  {i:2d}. {p['name']}  {DIM}({p.get('tracks', {}).get('total')} Titel){OFF}")
+        print(f"      {DIM}{p['id']}{OFF}")
+
+
+def cmd_playlist(args):
+    if not args:
+        die("Benutzung: spotifyctl playlist <id|url>")
+    pid = args[0].split("/")[-1].split("?")[0]
+    t = call("GET", "/playlists/" + pid) or {}
+    print(f"{BOLD}{t.get('name')}{OFF}  {DIM}({t.get('tracks', {}).get('total')} Titel){OFF}")
+    for i, it in enumerate((t.get("tracks") or {}).get("items", [])[:30], 1):
+        if it.get("track"):
+            fmt_track(it["track"], prefix=f"  {i:2d}. ")
+    print(f"{DIM}Abspielen:  spotifyctl playcontext spotify:playlist:{pid}{OFF}")
+
+
+def cmd_playcontext(args):
+    if not args:
+        die("Benutzung: spotifyctl playcontext spotify:playlist:<id>")
+    did = ensure_device()
+    call("PUT", _play_url(did), {"context_uri": args[0]})
+    print(f"▶ {args[0]}")
+
+
+def cmd_shuffle(args):
+    state = (args[0] if args else "on").lower() in ("on", "true", "1", "an")
+    call("PUT", f"/me/player/shuffle?state={'true' if state else 'false'}")
+    print(f"shuffle {'an' if state else 'aus'}")
+
+
+def cmd_repeat(args):
+    st = args[0] if args else "context"
+    call("PUT", f"/me/player/repeat?state={st}")
+    print(f"repeat {st}")
+
+
+def cmd_top(args):
+    r = call("GET", "/me/top/tracks?limit=20&time_range=medium_term") or {}
+    for i, t in enumerate(r.get("items", []), 1):
+        fmt_track(t, prefix=f"  {i:2d}. ")
+
+
+def cmd_recent(args):
+    r = call("GET", "/me/player/recently-played?limit=15") or {}
+    for i, it in enumerate(r.get("items", []), 1):
+        fmt_track(it["track"], prefix=f"  {i:2d}. ")
+
+
+def cmd_queue(args):
+    if not args:
+        q = call("GET", "/me/player/queue") or {}
+        if q.get("currently_playing"):
+            fmt_track(q["currently_playing"], prefix="▶ ")
+        for t in q.get("queue", [])[:10]:
+            fmt_track(t, prefix="  • ")
+        return
+    q = " ".join(args)
+    if q.startswith("spotify:"):
+        uri = q
+    else:
+        r = call("GET", "/search?" + urllib.parse.urlencode({"q": q, "type": "track", "limit": 1})) or {}
+        items = (r.get("tracks") or {}).get("items") or []
+        if not items:
+            die("Nichts gefunden.")
+        uri = items[0]["uri"]
+    call("POST", "/me/player/queue?uri=" + urllib.parse.quote(uri))
+    print("+ zur Warteschlange")
+
+
+def cmd_whoami():
+    p = call("GET", "/me") or {}
+    print(f"{BOLD}{p.get('display_name')}{OFF}  {DIM}({p.get('id')}, {p.get('product')}, "
+          f"{p.get('country')}){OFF}")
+
+
+def cmd_login():
+    try:
+        tokenstore.login(TOKEN_NAME)
+    except TokenError as e:
+        die(str(e))
+
+
+COMMANDS = {
+    "login": lambda a: cmd_login(),
+    "whoami": lambda a: cmd_whoami(),
+    "devices": lambda a: cmd_devices(),
+    "transfer": cmd_transfer,
+    "play": cmd_play,
+    "playcontext": cmd_playcontext,
+    "pause": lambda a: cmd_pause(),
+    "stop": lambda a: cmd_pause(),
+    "resume": lambda a: cmd_resume(),
+    "next": lambda a: cmd_next(),
+    "prev": lambda a: cmd_prev(),
+    "vol": cmd_vol,
+    "volume": cmd_vol,
+    "seek": cmd_seek,
+    "status": lambda a: cmd_status(),
+    "now": lambda a: cmd_status(),
+    "search": cmd_search,
+    "like": cmd_like,
+    "unlike": lambda a: cmd_like(["del"]),
+    "liked": cmd_liked,
+    "playlists": cmd_playlists,
+    "playlist": cmd_playlist,
+    "top": cmd_top,
+    "recent": cmd_recent,
+    "queue": cmd_queue,
+    "shuffle": cmd_shuffle,
+    "repeat": cmd_repeat,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        print("Befehle: " + ", ".join(sorted(COMMANDS)))
+        return
+    cmd = sys.argv[1]
+    if cmd not in COMMANDS:
+        die(f"Unbekannter Befehl '{cmd}'. Hilfe: spotifyctl help")
+    COMMANDS[cmd](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

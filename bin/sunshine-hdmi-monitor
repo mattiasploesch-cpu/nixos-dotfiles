@@ -1,0 +1,36 @@
+#!/bin/bash
+HDMI_STATUS="/sys/class/drm/card1-HDMI-A-2/status"
+CONFIG="/home/administrator/.config/sunshine/sunshine.conf"
+
+restart_sunshine() {
+    systemctl --user stop sunshine.service 2>/dev/null || true
+    sleep 1
+    pkill -f '^/usr/bin/sunshine' 2>/dev/null || true
+    sleep 1
+    systemctl --user start sunshine.service 2>/dev/null || true
+}
+
+was_connected=""
+current_xauth=""
+while true; do
+    status=$(cat "$HDMI_STATUS" 2>/dev/null || echo "unknown")
+    if [[ "$status" == "connected" ]]; then
+        if [[ "$was_connected" != "yes" ]]; then
+            sed -i 's/output_name = .*/output_name = 2/' "$CONFIG"
+            restart_sunshine
+            was_connected="yes"
+        fi
+    elif [[ "$status" == "disconnected" ]]; then
+        if [[ "$was_connected" != "no" ]]; then
+            sed -i 's/output_name = .*/output_name = 7/' "$CONFIG"
+            restart_sunshine
+            was_connected="no"
+        fi
+    fi
+    xauth=$(ls -t /tmp/xauth_* 2>/dev/null | head -1)
+    if [[ -n "$current_xauth" && -n "$xauth" && "$xauth" != "$current_xauth" ]]; then
+        restart_sunshine
+    fi
+    [[ -n "$xauth" ]] && current_xauth="$xauth"
+    sleep 2
+done

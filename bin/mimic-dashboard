@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# mimic-dashboard - oeffnet das mitmweb-Dashboard und legt das Passwort in die Zwischenablage.
+#
+#   http://127.0.0.1:8081      (Login: nur Passwort, Feld "token")
+#   Passwort   = Inhalt von ~/.config/mimic/token
+set -euo pipefail
+
+URL="http://127.0.0.1:8081"
+PASS_FILE="$HOME/.config/mimic/token"
+
+# laeuft der Proxy?
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$URL" || true)
+if [ -z "$code" ] || [ "$code" = "000" ]; then
+    echo "Dashboard nicht erreichbar - starte mimic-record.service ..."
+    systemctl --user start mimic-record.service
+    sleep 2
+fi
+
+# Passwort in die Zwischenablage (ohne Zeilenumbruch)
+if [ -f "$PASS_FILE" ]; then
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-copy >/dev/null; then
+        tr -d '\n' < "$PASS_FILE" | wl-copy || true
+    elif command -v xclip >/dev/null && [ -n "${DISPLAY:-}" ]; then
+        tr -d '\n' < "$PASS_FILE" | xclip -selection clipboard || true
+    else
+        echo "Passwort (bitte von Hand kopieren): $(cat "$PASS_FILE")"
+    fi
+else
+    echo "Kein Passwort gefunden: $PASS_FILE fehlt." >&2
+fi
+
+xdg-open "$URL" >/dev/null 2>&1 &
+echo "Dashboard: $URL"
+echo "Passwort liegt in der Zwischenablage -> ins Feld \"token\" einfuegen."

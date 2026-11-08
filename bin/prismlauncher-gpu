@@ -1,0 +1,16 @@
+#!/bin/bash
+AMD_CARD=""
+for card in /sys/class/drm/card*; do
+    [[ -L "$card" ]] || continue
+    v=$(cat "$card/device/vendor" 2>/dev/null)
+    if [[ "$v" == "0x1002" ]]; then
+        AMD_CARD=$(basename "$card")
+        break
+    fi
+done
+
+if [[ -n "$AMD_CARD" && -e "/dev/dri/${AMD_CARD}" ]]; then
+    exec env DRI_PRIME=1 prismlauncher "$@"
+else
+    exec prismlauncher "$@"
+fi

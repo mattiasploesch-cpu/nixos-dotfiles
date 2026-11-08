@@ -1,0 +1,391 @@
+#!/home/administrator/.local/share/uv/tools/mimic-client/bin/python
+"""mimic-app — generate ONE Python client for a WHOLE app (many hosts).
+
+`mimic gen` works per host. A real app talks to several hosts (API, accounts,
+uploads, …) that share one login. This wraps mimic's capture reader, collects the
+endpoints of every host you name, and asks the AI for a single client that owns
+one `mimic.Session` per host.
+
+Usage:
+    mimic-app spotify [-o spotify_app.py]            # fertige App (Token automatisch)
+    mimic-app hosts                                  # candidate hosts
+    mimic-app gen youtubei --hosts api.x.com,acc.x.com -o x_client.py
+    mimic-app gen myapp --match 'x\\.com$|xcdn\\.'
+    mimic-app gen myapp --hosts a,b --primary a --prompt-only
+Options: --har FILE, --generator claude|opencode, --model NAME, --out FILE.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+
+from mimic.sources import har as har_mod
+from mimic.sources import mitm
+
+TEMPLATE_SPOTIFY = os.path.expanduser("~/.local/share/mimic/templates/spotify_app.py")
+SHELL_SPOTIFY = os.path.expanduser("~/.local/share/mimic/templates/app_shell_spotify.py")
+SHELL_GENERIC = os.path.expanduser("~/.local/share/mimic/templates/app_shell_generic.py")
+
+
+def dep_header():
+    """PEP-723-Kopf fuer generierte Clients: `uv run datei.py` holt mimic selbst."""
+    try:
+        import mimic as _mimic
+
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(_mimic.__file__)))
+    except Exception:
+        return ""
+    if not os.path.exists(os.path.join(repo, "pyproject.toml")):
+        return ""
+    return (
+        "# /// script\n"
+        '# requires-python = ">=3.9"\n'
+        '# dependencies = ["mimic-client"]\n'
+        "#\n"
+        "# [tool.uv.sources]\n"
+        f'# mimic-client = {{ path = "{repo}" }}\n'
+        "# ///\n"
+    )
+
+
+def add_dep_header(source):
+    if source.lstrip().startswith("# ///"):
+        return source
+    head = dep_header()
+    if not head:
+        return source
+    if source.startswith("#!"):
+        first, _nl, rest = source.partition("\n")
+        return f"{first}\n{head}{rest}"
+    return head + source
+
+
+MAIN_GUARD = re.compile(r'^if\s+__name__\s*==\s*[\'"]__main__[\'"]\s*:', re.M)
+
+
+def add_app_shell(source, cls, hosts):
+    """Roh-Client zur fertigen App machen: interaktiver __main__-Teil anhängen."""
+    shell = (SHELL_SPOTIFY if any("spotify" in h for h in hosts) else SHELL_GENERIC)
+    try:
+        with open(shell) as fh:
+            block = fh.read().replace("__CLIENT_CLASS__", cls)
+    except OSError as exc:
+        print(f"! App-Teil übersprungen ({exc})", file=sys.stderr)
+        return source
+    if MAIN_GUARD.search(source):  # Beispiel-Main des Generators stilllegen
+        source = MAIN_GUARD.sub(
+            "if False:  # Beispiel-Main des Generators (ersetzt durch den App-Teil unten)",
+            source, count=1)
+    return source.rstrip() + "\n\n\n" + block
+
+
+# media / telemetry / cdn hosts that are noise for an API client by default
+NOISE = re.compile(
+    r"googlevideo|ytimg|ggpht|gstatic|doubleclick|googleads|gvt1|"
+    r"youtube\.com$|yt3\.|play\.google|gvt2|googleusercontent|"
+    r"app-measurement|crashlytics|firebaselogging|analytics|telemetry"
+)
+
+
+def load_flows(args):
+    if getattr(args, "har", None):
+        return None, har_mod.load(args.har)
+    m = mitm.Mitm()
+    return m, m.flows()
+
+
+def endpoints_for(args, m, flows, host):
+    if getattr(args, "har", None):
+        return har_mod.endpoints(args.har, host)
+    return mitm.endpoints(m, flows, host)
+
+
+def pick_hosts(args, flows):
+    ranked = mitm.hosts(flows)
+    all_hosts = [h for h, _ in ranked]
+    if args.hosts:
+        return [h.strip() for h in args.hosts.split(",") if h.strip()]
+    if args.match:
+        rx = re.compile(args.match)
+        picked = [h for h in all_hosts if rx.search(h)]
+        if not picked:
+            sys.exit(f"no captured host matches /{args.match}/")
+        return picked
+    picked = [h for h in all_hosts if not NOISE.search(h)]
+    if not picked:
+        sys.exit("no captured hosts — use the app first, or pass --hosts/--match")
+    skipped = [h for h in all_hosts if h in set(all_hosts) - set(picked)]
+    print("auto-selected hosts (skip with --hosts/--match):", file=sys.stderr)
+    for h in picked:
+        print(f"  + {h}", file=sys.stderr)
+    for h in skipped:
+        print(f"  - {h}  (noise)", file=sys.stderr)
+    return picked
+
+
+PROMPT = """\
+You are writing ONE Python API client for an entire mobile app: `{name}`.
+Below is real captured HTTP traffic spanning MULTIPLE hosts of that app, recorded
+by a proxy while the user exercised the app with their own account. Merge it all
+into a single, clean, ergonomic client library.
+
+Rules:
+- Output ONE Python file, nothing else. No prose, no markdown fences.
+- Do NOT create or edit files yourself — write the whole code in your reply.
+- `from mimic import App, Session`.
+- Subclass `App`. Set `HOST = "{primary}"` — the app's main API host; the base
+  class pulls that host's auth/device headers automatically.
+- This app talks to more hosts than that. The primary host is "{primary}".
+  For every OTHER host below, create a `Session` in `__init__` and store it:
+      self.<short_name> = Session.from_mitm("<host>")
+  Call those with `self.<short_name>.get(...)` / `.post(...)`. The base `App`
+  session is `self` for the primary host. Auth per host is pulled from the
+  capture automatically — do NOT hardcode tokens, cookies, or headers.
+- Skip hosts that are pure static media/CDN/telemetry/config.
+- Give methods human names for what they DO (get_feed, send_message, like), not
+  the raw path. Infer intent from path, bodies and status codes.
+- Chain calls when an endpoint returns an id/token another endpoint needs
+  (cache it on the instance). Read the sample bodies to find dependencies.
+- Turn per-call values (ids, text, ratings) into method parameters; keep
+  per-user constants as defaults or instance state.
+- Add a one-line docstring per method. Keep it tight and readable.
+
+# The app's captured hosts
+{hostlist}
+
+{hostblocks}"""
+
+
+def build_prompt(name, primary, hosts, digests):
+    hostlist = "\n".join(f"- {h}" for h in hosts)
+    blocks = []
+    for h in hosts:
+        markers = "  (primary API host)" if h == primary else ""
+        blocks.append(f"## Host: {h}{markers}\n\n{digests[h]}")
+    return PROMPT.format(
+        name=name, primary=primary, hostlist=hostlist, hostblocks="\n\n".join(blocks)
+    )
+
+
+def sanitize(text):
+    """Remove NUL/control bytes — argv (opencode) can't carry them."""
+    return "".join(c for c in text if c in "\n\t" or ord(c) >= 32)
+
+
+def run_generator(prompt, generator, model, timeout=1800):
+    prompt = sanitize(prompt)
+    try:
+        if generator == "opencode":
+            proc = subprocess.run(
+                ["opencode", "run", prompt], capture_output=True, text=True, timeout=timeout
+            )
+        else:
+            proc = subprocess.run(
+                ["claude", "-p", "--model", model], input=prompt,
+                capture_output=True, text=True, timeout=timeout,
+            )
+    except FileNotFoundError:
+        sys.exit(f"`{generator}` CLI not found — or use --prompt-only")
+    except subprocess.TimeoutExpired:
+        sys.exit(f"{generator} hat nach {timeout}s nicht geantwortet — nochmal starten "
+                 f"oder mit --timeout SEKUNDEN erhöhen")
+    if proc.returncode != 0:
+        sys.exit(f"{generator} failed:\n{proc.stderr}")
+    return strip_fences(proc.stdout)
+
+
+def strip_fences(text):
+    m = re.search(r"```(?:python)?\n(.*?)```", text, re.S)
+    return (m.group(1) if m else text).strip() + "\n"
+
+
+def is_python(text):
+    """Echter Code oder nur Prosa? (opencode schreibt die Datei gern selbst.)"""
+    try:
+        compile(text, "<generator>", "exec")
+        return True
+    except (SyntaxError, ValueError):
+        return False
+
+
+def newest_py(since, exclude):
+    """Neueste .py-Datei im CWD, die während des Laufs entstanden ist."""
+    best, best_mtime = None, 0.0
+    ex = os.path.abspath(exclude) if exclude else ""
+    for name in sorted(os.listdir(".")):
+        if not name.endswith(".py") or os.path.abspath(name) == ex:
+            continue
+        try:
+            mtime = os.path.getmtime(name)
+        except OSError:
+            continue
+        if mtime >= since - 2 and mtime > best_mtime:
+            best, best_mtime = name, mtime
+    return best
+
+
+def cmd_hosts(args):
+    _, flows = load_flows(args)
+    for host, n in mitm.hosts(flows):
+        mark = "  (noise)" if NOISE.search(host) else ""
+        print(f"{n:>9}  {host}{mark}")
+
+
+def cmd_gen(args):
+    m, flows = load_flows(args)
+    hosts = pick_hosts(args, flows)
+    if not hosts:
+        sys.exit("no hosts selected")
+    primary = args.primary or hosts[0]
+    from mimic import codegen  # reuse the exact endpoint digest
+
+    digests, counts = {}, {}
+    for h in hosts:
+        eps = endpoints_for(args, m, flows, h)
+        if not eps:
+            print(f"  ! {h}: no endpoints, skipping", file=sys.stderr)
+            continue
+        counts[h] = len(eps)
+        digests[h] = codegen.build_digest(eps)
+    hosts = [h for h in hosts if h in digests]
+    if not hosts:
+        sys.exit("none of the selected hosts had captured endpoints")
+    if primary not in digests:
+        primary = hosts[0]
+
+    prompt = build_prompt(args.name, primary, hosts, digests)
+    if args.prompt_only:
+        print(prompt)
+        return
+
+    started = time.time()
+    print(
+        f"asking {args.generator} to write one client for {args.name} "
+        f"({len(hosts)} hosts: " + ", ".join(f"{h}({counts[h]})" for h in hosts) + ")…"
+        f"  (Timeout {args.timeout}s)",
+        file=sys.stderr,
+    )
+    source = run_generator(prompt, args.generator, args.model, args.timeout)
+    if not is_python(source):
+        written = newest_py(started, args.out)
+        if written:
+            print(f"  ({args.generator} hat {written} selbst geschrieben — übernehme die Datei)",
+                  file=sys.stderr)
+            with open(written) as fh:
+                source = fh.read()
+        else:
+            sys.exit("der Generator hat keinen Python-Code geliefert:\n\n" + source[:600])
+    source = add_dep_header(source)
+    cls = re.search(r"class\s+(\w+)\s*\(", source)
+    cls = cls.group(1) if cls else "Client"
+    if args.app:
+        source = add_app_shell(source, cls, hosts)
+    out = args.out or f"{re.sub(r'[^a-z0-9]+', '_', args.name.lower()).strip('_')}_client.py"
+    with open(out, "w") as f:
+        f.write(source)
+    if any("spotify" in h for h in hosts):
+        how = (f"    uv run {out}                  # Suche & Wiedergabe (interaktiv)\n"
+               f"    uv run {out} play \"daft punk\"\n"
+               f"    uv run {out} py <methode>     # Capture-Client aufrufen")
+    else:
+        how = (f"    uv run {out}                  # REPL mit allen Methoden\n"
+               f"    uv run {out} <methode> '{{\"id\": 1}}'")
+    print(
+        f"\nwrote {out}"
+        + ("  (nur Bibliothek)" if not args.app else "") + "\n\n"
+        f"{how}\n\noder importieren:\n\n    from {out[:-3]} import {cls}\n    app = {cls}()"
+    )
+
+
+def cmd_spotify(args):
+    """Fertige, lauffaehige Spotify-App erzeugen (Token holt sie sich selbst)."""
+    _, flows = load_flows(args)
+    spot = [(h, n) for h, n in mitm.hosts(flows) if "spotify" in h]
+    total = sum(n for _, n in spot)
+
+    if not os.path.exists(TEMPLATE_SPOTIFY):
+        sys.exit(f"Vorlage fehlt: {TEMPLATE_SPOTIFY}")
+    with open(TEMPLATE_SPOTIFY) as fh:
+        src = fh.read()
+
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    header = (
+        f"# Erzeugt von `mimic-app spotify` am {stamp}\n"
+        f"# Aufzeichnung: {total} Requests von {len(spot)} Spotify-Hosts"
+        + (f" ({', '.join(h for h, _ in spot[:3])} ...)" if spot else "")
+        + "\n"
+    )
+    first, rest = src.split("\n", 1)
+    src = f"{first}\n{header}{rest}"
+
+    try:
+        compile(src, args.out, "exec")
+    except SyntaxError as e:
+        sys.exit(f"Vorlage fehlerhaft: {e}")
+
+    out = args.out
+    with open(out, "w") as fh:
+        fh.write(src)
+    os.chmod(out, 0o755)
+
+    # Hinweis zum Token (ohne ihn anzuzeigen)
+    hint = "unbekannt"
+    try:
+        sys.path.insert(0, os.path.expanduser("~/.local/share/mimic"))
+        import tokenstore
+
+        tok = tokenstore.get_capture("spotify")
+        hint = ("automatisch aus dem Capture (nichts kopieren noetig)" if tok
+                else "noch keiner - Spotify am Handy oeffnen und App neu erzeugen")
+    except Exception:
+        pass
+
+    print(f"\nwrote {out}")
+    print(f"  Aufzeichnung: {total} Spotify-Requests / {len(spot)} Hosts")
+    print(f"  Token:        {hint}")
+    print(f"\nstarten:\n    python3 {out}\n")
+    print(f"oder direkt:\n    python3 {out} play \"daft punk\"\n"
+          f"    python3 {out} search \"daft punk\"\n"
+          f"    python3 {out} status")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="mimic-app", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    hp = sub.add_parser("hosts", help="list captured hosts (noise marked)")
+    hp.add_argument("--har", metavar="FILE")
+    hp.set_defaults(func=cmd_hosts)
+
+    sp = sub.add_parser("spotify", help="fertige, lauffaehige Spotify-App erzeugen")
+    sp.add_argument("-o", "--out", default="spotify_app.py", help="Zieldatei")
+    sp.add_argument("--har", metavar="FILE")
+    sp.set_defaults(func=cmd_spotify)
+
+    gp = sub.add_parser("gen", help="generate ONE client for a whole app")
+    gp.add_argument("name", help="app name, e.g. youtube")
+    gp.add_argument("--hosts", help="comma-separated hosts")
+    gp.add_argument("--match", help="regex selecting hosts from the capture")
+    gp.add_argument("--primary", help="main API host (default: first selected)")
+    gp.add_argument("-o", "--out", help="output .py path")
+    gp.add_argument("--model", default="sonnet")
+    gp.add_argument("--generator", default="claude", choices=["claude", "opencode"])
+    gp.add_argument("--prompt-only", action="store_true")
+    gp.add_argument("--timeout", type=int, default=1800,
+                    help="Sekunden, die die KI schreiben darf (Standard 1800)")
+    gp.add_argument("--app", dest="app", action="store_true", default=True,
+                    help="fertige, laufbare App anhängen (Standard)")
+    gp.add_argument("--no-app", dest="app", action="store_false",
+                    help="nur die Bibliothek schreiben")
+    gp.add_argument("--har", metavar="FILE")
+    gp.set_defaults(func=cmd_gen)
+
+    args = p.parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

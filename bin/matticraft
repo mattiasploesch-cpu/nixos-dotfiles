@@ -1,0 +1,5 @@
+#!/bin/sh
+# Installed by Matticraft install.sh - the stable way to start the game.
+GAME_DIR="${MATTICRAFT_GAME_DIR:-${HOME}/.matticraft}"
+mkdir -p "$GAME_DIR/mods"
+exec "/home/administrator/.local/share/matticraft/game/matticraft" --launchTarget neoforge --gameDir "$GAME_DIR" "$@"

@@ -1,0 +1,1908 @@
+#!/usr/bin/env python3
+"""povideo - video frame-by-frame viewer with yt-dlp + project export.
+
+Loads a video (file path or http(s) URL) fully into RAM (no disk writes),
+decodes it via ffmpeg and shows it in a GUI window.
+
+YouTube links are handled automatically: yt-dlp is loaded purely into RAM
+(preferred: the ~3 MB zipapp on a memfd, executed via sys.executable; fallback:
+platform binary in /dev/shm tmpfs) and the video is streamed into a RAM file
+as well (video stream, no merging, no audio).
+
+Controls:
+  Left mouse button  : click = next frame, drag = pan
+  Right mouse button : previous frame
+  Scroll wheel        : zoom in/out (up to 16x, pixel-crisp)
+  Middle mouse drag   : pan (alternative)
+  Timeline bar        : below the video, click/drag to seek (scrub)
+  Space              : play / pause (in place, with audio)
+  + / -              : volume up / down (audio is extracted to RAM, played via ffplay)
+  Left/Right arrow   : previous / next frame
+  N                  : skip to the next playlist video
+  F                  : fit video to window again
+  E                  : export project (single encrypted .pov, only povideo can open it)
+  Q / Esc            : quit
+
+Playlist links (watch?v=...&list=...): the current video plays first; when it
+finishes, the next video in the playlist is loaded into RAM and continues
+playing automatically (title shows [position/total]).
+
+Project export: E opens a save dialog. The result is ONE single binary file
+(.pov), not a zip - there is nothing to extract and no extraction program can
+get at the contents. Inside: AES-256-GCM encrypted (key derived from a
+povideo-only secret) and heavily zlib-9-compressed state (current frame
+index, zoom, pan, fps, video metadata), the whole original video, the yt-dlp
+bundle and a preview frame. Only povideo can decrypt it. Opening a project:
+povideo projekt.pov restores the exact frame/zoom state. yt-dlp itself runs
+purely from RAM (zipapp on a memfd, executed via sys.executable) - nothing
+is ever written to /tmp or the disk.
+
+The video automatically re-fits itself to the window size (e.g. when
+maximizing). Zooming with the wheel takes over; F or a window resize
+returns to auto-fit. Zoom is crop-based (only the visible region is
+upscaled), so it stays fast even at 16x.
+"""
+import atexit
+import ctypes
+import hashlib
+import hmac
+import io
+import json
+import os
+import platform
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+import zlib
+
+# holds the memfd fds for the whole process lifetime (RAM-backed, no disk writes)
+_OPEN_FDS = []
+
+# temporary RAM-filesystem paths (created in tmpfs) to delete at exit
+_SHM_CLEANUP = []
+
+
+def _shm_cleanup():
+    for p in _SHM_CLEANUP:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+atexit.register(_shm_cleanup)
+
+
+def ram_exec_path(data, name):
+    """Write an executable into /dev/shm (tmpfs = RAM, never /tmp) and return
+    its path. A raw memfd cannot run PyInstaller onefile binaries (yt-dlp),
+    because its bootloader re-opens /proc/self/exe and fails on the deleted
+    memfd path. tmpfs files are RAM-backed, just like memfds. Only used as a
+    fallback when the pure-RAM yt-dlp zipapp is unavailable."""
+    if not os.path.isdir("/dev/shm") or not os.access("/dev/shm", os.W_OK):
+        sys.exit("kein /dev/shm (tmpfs/RAM) verfuegbar fuer yt-dlp")
+    path = os.path.join("/dev/shm", f"povideo-{os.getpid()}-{name}")
+    with open(path, "wb", buffering=0) as f:
+        f.write(data)
+    os.chmod(path, 0o755)
+    _SHM_CLEANUP.append(path)
+    return path
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+    from PIL import Image, ImageTk
+except ImportError as e:
+    sys.exit(f"povideo needs tkinter and Pillow: {e}")
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    _AES = True
+except ImportError:
+    _AES = False
+
+_MAGIC = b"POVD"
+_VERSION = 1
+_PBKDF_ITERS = 600_000
+
+USAGE = "Usage: povideo <video-file | url | youtube-link | projekt.pov>"
+
+
+def _secret():
+    # 32-byte master key, stored XOR-masked so it is not readable in plain text.
+    masked = bytes.fromhex(
+        "31bd50454d434a49a841f070203f7c7920041753fbfea4ce3fcef950f5888187"
+    )
+    mask = bytes.fromhex(
+        "fa465f62ea1034f5cfc93d21af63ff079dfdfe9b25bb6e433e6b0df62a91631e"
+    )
+    return bytes(a ^ b for a, b in zip(masked, mask))
+
+
+def memfd_new(name=b"povideo"):
+    libc = ctypes.CDLL(None)
+    create = libc.memfd_create
+    create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+    create.restype = ctypes.c_int
+    fd = create(name, 0)
+    if fd < 0:
+        sys.exit("memfd_create failed")
+    _OPEN_FDS.append(fd)
+    return fd
+
+
+def to_memfd(data, name=b"povideo"):
+    """Wrap raw bytes in an anonymous, seekable RAM file (memfd). Returns a path.
+    The file offset is reset to 0 so children that open /proc/self/fd/N read
+    the data from the start (open() shares the file description/offset)."""
+    fd = memfd_new(name)
+    os.write(fd, data)
+    os.lseek(fd, 0, 0)
+    return f"/proc/self/fd/{fd}"
+
+
+def _pass_fds(path):
+    if path.startswith("/proc/self/fd/"):
+        try:
+            return (int(path[len("/proc/self/fd/"):]),)
+        except ValueError:
+            pass
+    return ()
+
+
+def looks_like_url(s):
+    return s.startswith("http://") or s.startswith("https://")
+
+
+def is_youtube(s):
+    if not looks_like_url(s):
+        return False
+    host = (urllib.parse.urlsplit(s).netloc or "").lower()
+    return host == "youtu.be" or host.endswith("youtube.com") or host.endswith("youtube-nocookie.com")
+
+
+def fetch_bytes(src, timeout=60):
+    """Fetch the whole video into RAM. Returns raw bytes."""
+    if looks_like_url(src):
+        try:
+            with urllib.request.urlopen(src, timeout=timeout) as r:
+                return r.read()
+        except Exception as e:
+            sys.exit(
+                f"Download failed ({e}). If the URL contains a JWT token it may "
+                "have expired - copy the URL fresh from the browser."
+            )
+    if not os.path.exists(src):
+        sys.exit(f"File not found: {src}")
+    with open(src, "rb") as f:
+        return f.read()
+
+
+def download_bytes(url, timeout=120):
+    req = urllib.request.Request(url, headers={"User-Agent": "povideo"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+# ---------------------------------------------------------------------------
+# yt-dlp: binary into RAM (memfd), executed from there, video streamed to RAM
+# ---------------------------------------------------------------------------
+
+_YTDLP = {"path": None, "data": None, "run_with": None, "name": None}
+
+
+def _ytdlp_asset_name():
+    sysname = platform.system().lower()
+    machine = platform.machine().lower()
+    if sysname == "windows":
+        return "yt-dlp.exe"
+    if sysname == "darwin":
+        return "yt-dlp_macos_arm64" if machine in ("arm64", "aarch64") else "yt-dlp_macos"
+    if sysname == "linux":
+        return "yt-dlp_linux_aarch64" if machine in ("aarch64", "arm64") else "yt-dlp_linux"
+    return None
+
+
+def fetch_ytdlp():
+    """Load yt-dlp into RAM. Returns (path, run_with, data).
+
+    Preferred: the pure-Python zipapp asset ("yt-dlp", ~3 MB) stored on a
+    memfd and run with sys.executable - no extraction, no temp files at all,
+    nothing touches /tmp. Fallback: the platform PyInstaller binary in
+    /dev/shm (tmpfs = RAM) with TMPDIR pointed at /dev/shm so even its
+    bootloader extraction stays in RAM.
+    """
+    if _YTDLP["path"] is not None:
+        return _YTDLP["path"], _YTDLP["run_with"], _YTDLP["data"]
+    print("Hole yt-dlp release info ...")
+    try:
+        info = json.loads(
+            download_bytes(
+                "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest", 30
+            ).decode()
+        )
+        assets = {a["name"]: a["browser_download_url"] for a in info.get("assets", [])}
+        tag = info.get("tag_name", "?")
+    except Exception as e:
+        sys.exit(f"yt-dlp release-Info nicht ladbar: {e}")
+
+    name, run_with = "yt-dlp", [sys.executable]  # pure-RAM zipapp
+    if name not in assets:
+        name = _ytdlp_asset_name()
+        run_with = None  # PyInstaller binary (fallback, /dev/shm only)
+        if name is not None and name not in assets:
+            name = None
+    if name is None:
+        sys.exit("Kein passendes yt-dlp asset gefunden.")
+    print(f"yt-dlp {tag} ({name}) -> RAM ...")
+    data = download_bytes(assets[name], 300)
+    if run_with is None:
+        path = ram_exec_path(data, "yt-dlp")  # PyInstaller binary: needs a path
+    else:
+        path = to_memfd(data, b"yt-dlp")      # zipapp: pure memfd, no temp dirs
+    _YTDLP.update(path=path, data=data, run_with=run_with, name=name)
+    print(f"yt-dlp {tag} in RAM ({len(data) / 1e6:.1f} MB, {('zipapp' if run_with else 'binary')})")
+    return path, run_with, data
+
+
+def run_ytdlp(url, extra_args, stdout_file=None, timeout=1800):
+    """Run yt-dlp from RAM. stdout_file (optional fd) gets all stdout bytes.
+
+    Each zipapp run gets a fresh private memfd copy: the memfd file offset
+    is shared between processes, so parallel runs would corrupt each other.
+    """
+    path, run_with, data = fetch_ytdlp()
+    if run_with:
+        yfd = os.memfd_create("yt-dlp")
+        os.pwrite(yfd, data, 0)
+        path = f"/proc/self/fd/{yfd}"  # child gets this fd via pass_fds
+    else:
+        yfd = int(path.rsplit("/", 1)[1])
+        os.lseek(yfd, 0, 0)  # shared offset: rewind so the child reads from start
+    cmd = (run_with or []) + [path] + extra_args + [url]
+    pass_fds = (yfd,)
+    env = None
+    if run_with is None:
+        env = dict(os.environ)
+        env["TMPDIR"] = "/dev/shm"  # keep the PyInstaller bootloader in RAM too
+    if stdout_file is not None:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            pass_fds=pass_fds + (stdout_file,), env=env,
+        )
+        try:
+            while True:
+                chunk = proc.stdout.read(1 << 20)
+                if not chunk:
+                    break
+                os.write(stdout_file, chunk)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=max(5, timeout))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        proc.stderr = proc.stderr.read()
+        proc.stdout.close()
+        if run_with:
+            os.close(yfd)
+        return proc
+    try:
+        return subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, pass_fds=pass_fds, env=env,
+        )
+    finally:
+        if run_with:
+            os.close(yfd)
+
+
+# youtube player clients to rotate through until one works (403/DRM workaround)
+_YTC = ["android", "android_vr", "tv_embedded", "web_embedded", "web_safari", "mweb", "ios", "tv"]
+
+
+def _client_args(client):
+    return ["--extractor-args", f"youtube:player_client={client}"]
+
+
+def youtube_info(url):
+    """Get metadata + direct stream URLs via yt-dlp -J (no download).
+
+    Probes ALL player clients in parallel and returns (infos, sels) sorted
+    by quality (highest resolution first), so the downloader can fall back
+    to the next-best option if the best one fails (HTTP 403 / DRM etc.).
+    """
+    fetch_ytdlp()
+    results = []
+    lock = threading.Lock()
+
+    def probe(client):
+        try:
+            p = run_ytdlp(
+                url,
+                ["--no-playlist", "--no-warnings", "--no-cache-dir",
+                 "--skip-download", "-J"] + _client_args(client),
+                timeout=60,
+            )
+            if p.returncode == 0:
+                info = json.loads(p.stdout.decode(errors="replace"))
+                sel = _pick_formats(info)
+                if sel:
+                    sel["client"] = client
+                    with lock:
+                        results.append((_sel_quality(sel), info, sel))
+        except Exception:
+            pass
+
+    threads = [threading.Thread(target=probe, args=(c,), daemon=True)
+               for c in _YTC]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=75)
+    good = [r for r in results if r[1] is not None]
+    if not good:
+        sys.exit(
+            "yt-dlp Video-Info fehlgeschlagen fuer alle Clients.\n"
+            "(Tipp: YouTube blockt dieses Video fuer diese IP/ohne Cookies, "
+            "oder das Video ist DRM-geschuetzt.)"
+        )
+    good.sort(key=lambda r: r[0], reverse=True)
+    return [r[1] for r in good], [r[2] for r in good]
+
+
+def _quality(fmt):
+    return (fmt.get("width") or 0) * (fmt.get("height") or 0)
+
+
+def _pick_formats(info):
+    """Pick the best playable video stream (+ separate audio if available).
+
+    Prefers the highest-resolution mp4 video-only stream + m4a audio;
+    falls back to the highest-resolution combined format (video+audio in
+    one file, e.g. format 18/22 on the android client). Ignores mhtml /
+    DASH-segment formats (direct-URL progressive downloads only).
+    """
+    fmts = [f for f in info.get("formats", [])
+            if f.get("url") and f.get("protocol") not in ("mhtml", "http_dash_segments")]
+    if not fmts:
+        return None
+    vids = [f for f in fmts if f.get("vcodec") not in (None, "none")]
+    vids_only = [f for f in vids if f.get("acodec") in (None, "none")]
+    mp4v = sorted([f for f in vids_only if f.get("ext") == "mp4"],
+                  key=_quality, reverse=True)
+    auds = sorted(
+        [f for f in fmts if f.get("acodec") not in (None, "none")
+         and f.get("vcodec") in (None, "none")],
+        key=lambda f: f.get("abr") or f.get("tbr") or 0, reverse=True)
+    m4aa = [f for f in auds if f.get("ext") in ("m4a", "mp4")]
+    combined = sorted(
+        [f for f in vids if f.get("acodec") not in (None, "none")],
+        key=_quality, reverse=True)
+
+    video = (mp4v or vids_only or vids or combined)[0]
+    fps = info.get("fps") or video.get("fps") or 30.0
+    if not (0 < float(fps) <= 1000):
+        fps = 30.0
+    base = {
+        "fps": float(fps),
+        "duration": info.get("duration") or 0,
+        "width": video.get("width") or info.get("width") or 0,
+        "height": video.get("height") or info.get("height") or 0,
+        "title": info.get("title") or "",
+        "id": info.get("id") or "",
+        "ext": video.get("ext"),
+    }
+    if video.get("acodec") not in (None, "none"):
+        # combined format: audio lives inside the video stream
+        base["video_url"] = video["url"]
+        base["audio_url"] = None
+        base["total"] = video.get("filesize") or video.get("filesize_approx")
+        return base
+    audio = (m4aa or auds or [None])[0]
+    base["video_url"] = video["url"]
+    base["audio_url"] = audio["url"] if audio else None
+    base["total"] = video.get("filesize") or video.get("filesize_approx")
+    base["audio_total"] = (audio.get("filesize") or audio.get("filesize_approx")
+                           if audio else None)
+    return base
+
+
+def _sel_quality(sel):
+    q = (sel.get("width") or 0) * (sel.get("height") or 0)
+    if sel.get("audio_url"):
+        q += 1  # separate audio stream: small bonus over combined
+    return q
+
+
+def fetch_playlist(url):
+    """Return (entries, start_index) for a playlist URL.
+
+    entries: list of (video_id, title). start_index: position of the video
+    named in the URL (v= / index=), default 0.
+    """
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    entries = []
+    for client in _YTC:
+        try:
+            p = run_ytdlp(
+                url,
+                ["--no-warnings", "--no-cache-dir", "--flat-playlist", "-J",
+                 "--extractor-args", f"youtube:player_client={client}"],
+                timeout=300,
+            )
+            if p.returncode == 0:
+                info = json.loads(p.stdout.decode())
+                for e in info.get("entries", []):
+                    if e.get("id"):
+                        entries.append((e["id"], e.get("title") or e["id"]))
+                break
+        except Exception:
+            continue
+    if not entries:
+        sys.exit("Playlist konnte nicht gelesen werden.")
+
+    start = 0
+    vid = query.get("v", [None])[0]
+    if vid:
+        for i, (eid, _t) in enumerate(entries):
+            if eid == vid:
+                start = i
+                break
+    idx = query.get("index", [None])[0]
+    if idx and idx.isdigit():
+        start = min(max(int(idx) - 1, 0), len(entries) - 1)
+    return entries, start
+
+
+# ---------------------------------------------------------------------------
+# ffmpeg decode helpers
+# ---------------------------------------------------------------------------
+
+def probe_fps(path):
+    try:
+        p = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=r_frame_rate",
+                "-of", "default=noprint_wrappers=1:nokey=1", "-i", path,
+            ],
+            capture_output=True, timeout=120, pass_fds=_pass_fds(path),
+        )
+        num, den = p.stdout.decode().strip().split("/")
+        fps = float(num) / float(den)
+        return fps if 0 < fps < 1000 else 30.0
+    except Exception:
+        return 30.0
+
+
+def decode_frames(path):
+    """Decode the video to a list of JPEG frames held in RAM."""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path,
+        "-an", "-sn", "-f", "mjpeg", "-q:v", "2", "pipe:1",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, pass_fds=_pass_fds(path))
+    out = proc.stdout.read()
+    proc.wait()
+
+    frames = []
+    start = 0
+    while True:
+        soi = out.find(b"\xff\xd8", start)
+        if soi == -1:
+            break
+        eoi = out.find(b"\xff\xd9", soi)
+        if eoi == -1:
+            break
+        frames.append(out[soi:eoi + 2])
+        start = eoi + 2
+    return frames
+
+
+# ---------------------------------------------------------------------------
+# audio: extracted to RAM (AAC/ADTS), played with ffplay
+# ---------------------------------------------------------------------------
+
+def extract_audio(path):
+    """Extract the audio track into RAM as AAC/ADTS. Returns bytes (or b"")."""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path,
+        "-vn", "-sn", "-dn", "-c:a", "aac", "-b:a", "128k", "-f", "adts", "pipe:1",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, pass_fds=_pass_fds(path))
+    out = proc.stdout.read()
+    proc.wait()
+    return out
+
+
+def probe_duration(path):
+    """Duration in seconds from the container header (needs only moov + tail)."""
+    try:
+        p = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=20,
+            pass_fds=_pass_fds(path),
+        )
+        return float((p.stdout or "").strip() or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _write_fifo(fd, data, stop_check):
+    """Write all data to a non-blocking RAM FIFO (or give up on stop)."""
+    off = 0
+    while off < len(data) and not stop_check():
+        try:
+            off += os.write(fd, data[off:])
+        except BlockingIOError:
+            time.sleep(0.05)
+        except OSError:
+            break
+
+
+def _audio_pass(src_path, start_t, dur_t, out_fd, stop_check):
+    """One incremental ADTS extraction pass; returns ffmpeg's out_time (s)."""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-ss", f"{start_t:.3f}", "-i", src_path,
+        "-vn", "-sn", "-dn", "-c:a", "copy", "-f", "adts",
+        "-progress", "pipe:2", "-loglevel", "error",
+        "-t", f"{dur_t:.3f}", "pipe:1",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            pass_fds=_pass_fds(src_path))
+    while True:
+        chunk = proc.stdout.read(65536)
+        if not chunk:
+            break
+        _write_fifo(out_fd, chunk, stop_check)
+        if stop_check():
+            break
+    proc.stdout.close()
+    err = proc.stderr.read().decode("utf-8", "replace")
+    proc.stderr.close()
+    proc.wait()
+    for line in err.splitlines():
+        if line.startswith("out_time_us="):
+            try:
+                return int(line.split("=", 1)[1].strip()) / 1e6
+            except ValueError:
+                pass
+    return 0.0
+
+
+def start_audio(audio_path, volume, ss=None):
+    """Play the RAM audio file with ffplay (nodisp). Volume 0-300 %."""
+    vol = max(0, min(300, int(volume)))
+    cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]
+    if ss is not None:
+        cmd += ["-ss", f"{ss:.3f}"]
+    if vol <= 100:
+        cmd += ["-volume", str(vol)]
+    else:
+        cmd += ["-af", f"volume={vol / 100:.3f}"]
+    cmd.append(audio_path)
+    return subprocess.Popen(
+        cmd,
+        pass_fds=_pass_fds(audio_path),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def stop_audio(proc):
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Progressive download: small 1 MB chunks via HTTP Range into a RAM memfd
+# ---------------------------------------------------------------------------
+
+_CHUNK = 1 * 1024 * 1024   # one small chunk per request, never more
+_TAIL = 8 * 1024 * 1024    # last 8 MB fetched early (moov-at-end fallback)
+_MAX_FAILS = 6
+_WORKERS = 6               # parallel 1 MB range requests (youtube throttles single)
+
+
+class RamDownloader:
+    """Downloads a URL into a RAM memfd in small sequential chunks.
+
+    Only tiny ranges are requested at once (_CHUNK = 1 MB), fetched by a few
+    parallel workers; `written` always tracks the longest contiguous prefix,
+    so playback can start after a few MB and decoding never sees gaps.
+    """
+
+    def __init__(self, url, name=b"povideo_dl"):
+        self.url = url
+        self.fd = memfd_new(name)
+        self.total = None
+        self.written = 0
+        self.tail_written = False
+        self.done = False
+        self.error = None
+        self.speed = 0.0
+        self.eta = None
+        self._stop = False
+        self._lock = threading.Lock()
+        self._next = 0
+        self._chunks = []
+        self._prefix = 0
+        self._fails = 0
+        self._last_t = time.time()
+        self._last_b = 0
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self):
+        self._stop = True
+
+    def path(self):
+        return f"/proc/self/fd/{self.fd}"
+
+    def _req(self, start, end, timeout=30):
+        req = urllib.request.Request(
+            self.url,
+            headers={"Range": f"bytes={start}-{end}", "User-Agent": "povideo/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+
+    def _init_total(self):
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(
+                    self.url,
+                    headers={"Range": "bytes=0-0", "User-Agent": "povideo/1.0"},
+                )
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    cr = r.headers.get("Content-Range") or ""
+                    if "/" in cr:
+                        self.total = int(cr.rsplit("/", 1)[1])
+                        return
+            except Exception:
+                time.sleep(1.0 + attempt)
+        self.total = None
+
+    def _worker(self):
+        while not self._stop:
+            with self._lock:
+                idx = self._next
+                if idx >= len(self._chunks):
+                    return
+                self._next = idx + 1
+            start = idx * _CHUNK
+            end = min(self.total - 1, start + _CHUNK - 1)
+            try:
+                data = self._req(start, end)
+                os.pwrite(self.fd, data, start)
+                with self._lock:
+                    self._chunks[idx] = 1
+                    while (self._prefix < len(self._chunks)
+                           and self._chunks[self._prefix]):
+                        self._prefix += 1
+                    self.written = min(self._prefix * _CHUNK, self.total)
+                    now = time.time()
+                    if now - self._last_t >= 1.0:
+                        self.speed = (self.written - self._last_b) / (now - self._last_t)
+                        self._last_b, self._last_t = self.written, now
+                        self.eta = ((self.total - self.written) / self.speed
+                                    if self.speed > 0 else None)
+                    self._fails = 0
+            except urllib.error.HTTPError as e:
+                with self._lock:
+                    if self.error is None:
+                        self.error = f"HTTP {e.code}"
+                return
+            except Exception:
+                with self._lock:
+                    self._next = min(self._next, idx)  # back for a retry
+                    self._fails += 1
+                    if self._fails >= _MAX_FAILS and self.error is None:
+                        self.error = f"Download abgebrochen ({_MAX_FAILS} Fehler)"
+                time.sleep(1.0)
+                if self.error:
+                    return
+
+    def _run(self):
+        try:
+            self._init_total()
+            if self.total is None:
+                # no Range support: one continuous sequential stream
+                req = urllib.request.Request(
+                    self.url, headers={"User-Agent": "povideo/1.0"})
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    self.total = int(r.headers.get("Content-Length") or 0)
+                    while not self._stop:
+                        c = r.read(_CHUNK)
+                        if not c:
+                            break
+                        os.write(self.fd, c)
+                        self.written += len(c)
+                self.done = not self._stop
+                return
+
+            os.ftruncate(self.fd, self.total)
+            self._chunks = [0] * ((self.total + _CHUNK - 1) // _CHUNK)
+            if self.total > _TAIL * 4:
+                try:
+                    tail = self._req(self.total - _TAIL, self.total - 1)
+                    os.pwrite(self.fd, tail, self.total - len(tail))
+                    self.tail_written = True
+                except Exception:
+                    pass
+            self._next = 0
+            workers = [threading.Thread(target=self._worker, daemon=True)
+                       for _ in range(_WORKERS)]
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join()
+            with self._lock:
+                self.done = (not self._stop and self.error is None
+                             and all(self._chunks)
+                             and self.written >= self.total)
+        except Exception as e:
+            self.error = str(e)
+
+
+# ---------------------------------------------------------------------------
+# Progressive playback: decode frames as small byte regions arrive
+# ---------------------------------------------------------------------------
+
+_MIN_START = 6 * 1024 * 1024   # moov + first frames must be present
+_PASS_BYTES = 4 * 1024 * 1024  # decode another pass every 4 MB
+_PASS_SECONDS = 40.0           # each ffmpeg pass decodes at most 40 s
+
+
+def _decode_partial(dl, ss, cap):
+    """Decode up to `cap` frames starting at `ss` seconds from the memfd.
+
+    Only the bytes currently downloaded are available; input seeking works
+    because the moov atom sits at the start (or the tail was prefetched).
+    Returns a list of JPEG frames (maybe empty).
+    """
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{ss:.3f}", "-i", dl.path(),
+        "-an", "-sn", "-frames:v", str(cap), "-f", "mjpeg", "-q:v", "2", "pipe:1",
+    ]
+    try:
+        pr = subprocess.run(cmd, capture_output=True, timeout=600,
+                            pass_fds=(dl.fd,))
+    except Exception:
+        return []
+    out = pr.stdout
+    frames = []
+    start = 0
+    while True:
+        soi = out.find(b"\xff\xd8", start)
+        if soi == -1:
+            break
+        eoi = out.find(b"\xff\xd9", soi)
+        if eoi == -1:
+            break
+        frames.append(out[soi:eoi + 2])
+        start = eoi + 2
+    return frames
+
+
+class ProgressiveLoad:
+    """Downloads video (and audio) progressively and decodes frames as data
+    arrives. Frames are appended to the shared `frames` list for the GUI.
+
+    Accepts a list of selections (best quality first); if the download fails
+    (HTTP 403 etc.) it automatically falls back to the next option."""
+
+    def __init__(self, sels):
+        self.sels = list(sels)
+        self.sel = self.sels[0]
+        self.video_dl = None
+        self.audio_dl = None
+        self.frames = []
+        self.fps = float(self.sel.get("fps") or 30.0)
+        self.done = False
+        self.error = None
+        self._stop = False
+
+    def start(self, on_first=None, on_error=None):
+        self._activate(0)
+        threading.Thread(target=self._loop, args=(on_first, on_error),
+                         daemon=True).start()
+
+    def _activate(self, idx):
+        if self.video_dl is not None:
+            self.video_dl.stop()
+            if self.audio_dl is not None:
+                self.audio_dl.stop()
+        self.sel = self.sels[idx]
+        self.video_dl = RamDownloader(self.sel["video_url"], b"povideo_video")
+        self.audio_dl = (RamDownloader(self.sel["audio_url"], b"povideo_audio")
+                         if self.sel.get("audio_url") else None)
+        self.video_dl.start()
+        if self.audio_dl is not None:
+            self.audio_dl.start()
+
+    def stop(self):
+        self._stop = True
+        if self.video_dl is not None:
+            self.video_dl.stop()
+        if self.audio_dl is not None:
+            self.audio_dl.stop()
+
+    def _loop(self, on_first, on_error):
+        dl = self.video_dl
+        last_t = 0.0
+        decoded_bytes = 0
+        first = False
+        try:
+            while not self._stop:
+                if dl.error:
+                    # try the next quality/client option
+                    nxt = self.sels.index(self.sel) + 1
+                    if nxt < len(self.sels):
+                        print(f"Qualitaet/Client '{self.sel.get('client')}' fehlgeschlagen "
+                              f"({dl.error}), nehme naechste Option ({nxt + 1}/{len(self.sels)}) ...")
+                        self.frames.clear()
+                        decoded_bytes = 0
+                        last_t = 0.0
+                        first = False
+                        self._activate(nxt)
+                        dl = self.video_dl
+                        continue
+                    self.error = dl.error
+                    if on_error:
+                        on_error(dl.error)
+                    return
+                avail = dl.written
+                final = dl.done and (avail - decoded_bytes < _PASS_BYTES)
+                if (avail >= _MIN_START or final) and (
+                        avail - decoded_bytes >= _PASS_BYTES or final):
+                    cap = int(_PASS_SECONDS * self.fps) + 4
+                    new = _decode_partial(dl, last_t, cap)
+                    if new:
+                        self.frames.extend(new)
+                        last_t = len(self.frames) / self.fps
+                        decoded_bytes = avail
+                        if not first:
+                            first = True
+                            if on_first:
+                                on_first()
+                        continue
+                    if final and avail >= dl.total:
+                        self.done = True
+                        return
+                    time.sleep(1.0)
+                    continue
+                time.sleep(1.5)
+            self.done = True
+        except Exception as e:
+            self.error = str(e)
+            if on_error:
+                on_error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Project files: encrypted, compressed, povideo-only
+# ---------------------------------------------------------------------------
+
+def _kdf(salt):
+    return hashlib.pbkdf2_hmac("sha256", _secret(), salt, _PBKDF_ITERS, 32)
+
+
+def _stream(key, nonce, length):
+    out = bytearray()
+    counter = 0
+    while len(out) < length:
+        out += hmac.new(key, nonce + counter.to_bytes(4, "big"), hashlib.sha256).digest()
+        counter += 1
+    return bytes(out[:length])
+
+
+def _encrypt(plain, salt):
+    key = _kdf(salt)
+    if _AES:
+        nonce = os.urandom(12)
+        return b"A" + nonce + AESGCM(key).encrypt(nonce, plain, None)
+    nonce = os.urandom(16)
+    ct = bytes(a ^ b for a, b in zip(plain, _stream(key, nonce, len(plain))))
+    mac = hmac.new(key, nonce + ct, hashlib.sha256).digest()
+    return b"S" + nonce + mac + ct
+
+
+def _decrypt(blob, salt):
+    key = _kdf(salt)
+    if blob[:1] == b"A":
+        nonce, ct = blob[1:13], blob[13:]
+        return AESGCM(key).decrypt(nonce, ct, None)
+    nonce, mac, ct = blob[1:17], blob[17:49], blob[49:]
+    if not hmac.compare_digest(hmac.new(key, nonce + ct, hashlib.sha256).digest(), mac):
+        raise ValueError("Integritaetspruefung fehlgeschlagen")
+    return bytes(a ^ b for a, b in zip(ct, _stream(key, nonce, len(ct))))
+
+
+def _chunk(comp, raw):
+    # flag 1 = zlib-compressed, 0 = raw
+    if comp is not None and len(comp) < len(raw):
+        return b"\x01" + struct.pack("<Q", len(comp)) + comp
+    return b"\x00" + struct.pack("<Q", len(raw)) + raw
+
+
+def _pack_project(state_json, video, ytdlp, frame_jpeg):
+    """Compress everything (zlib 9), then encrypt the whole blob (AES-256-GCM)."""
+    sj = json.dumps(state_json).encode()
+    body = (
+        _chunk(zlib.compress(sj, 9), sj)
+        + _chunk(zlib.compress(video, 9), video)
+        + _chunk(zlib.compress(ytdlp, 9), ytdlp if ytdlp else b"")
+        + _chunk(zlib.compress(frame_jpeg, 9), frame_jpeg)
+    )
+    salt = os.urandom(16)
+    return _MAGIC + bytes([_VERSION]) + salt + _encrypt(body, salt)
+
+
+def _unpack_project(blob):
+    if blob[:4] != _MAGIC:
+        raise ValueError("keine povideo Projekt-Datei")
+    salt = blob[5:21]
+    body = _decrypt(blob[21:], salt)
+    pos = 0
+    parts = []
+    for _ in range(4):
+        flag, ln = struct.unpack("<BQ", body[pos:pos + 9])
+        pos += 9
+        payload = body[pos:pos + ln]
+        pos += ln
+        if flag == 1:
+            payload = zlib.decompress(payload)
+        parts.append(payload)
+    return json.loads(parts[0].decode()), parts[1], parts[2], parts[3]
+
+
+def save_project_file(out_path, state_json, video, ytdlp, frame_jpeg):
+    blob = _pack_project(state_json, video, ytdlp, frame_jpeg)
+    with open(out_path, "wb", buffering=0) as f:
+        f.write(blob)
+
+
+def load_project_file(path):
+    """Open a povideo project (.pov). Returns (meta, video_bytes, ytdlp_bytes)."""
+    with open(path, "rb") as f:
+        blob = f.read()
+    meta, video, ytdlp, _frame = _unpack_project(blob)
+    return meta, video, ytdlp
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
+        print(USAGE)
+        return 2
+
+    src = sys.argv[1].replace("\\", "").strip("'\"")  # clean shell-escaped URLs
+    meta = None
+    ytdlp_data = None
+    url_used = None
+    queue = []  # remaining playlist videos: [(url, title)]
+    queue_pos, queue_total = 1, 1
+    prog = None  # ProgressiveLoad for youtube: video bytes arrive in small chunks
+    data = None  # fully-loaded video bytes (None while progressive)
+
+    if src.lower().endswith(".pov"):
+        print("Oeffne povideo Projekt ...")
+        meta, data, ytdlp_data = load_project_file(src)
+        path = to_memfd(data)
+        fps = probe_fps(path)
+        print("Decoding ...")
+        frames = decode_frames(path)
+        if not frames:
+            sys.exit("No video frames found in project (corrupt .pov?).")
+        print(f"Loaded {len(frames)} frames @ {fps:.3f} fps")
+    elif is_youtube(src):
+        url_used = src
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(src).query)
+        if "list" in query:
+            print("Lese Playlist ...")
+            entries, start = fetch_playlist(src)
+            queue = [
+                (f"https://www.youtube.com/watch?v={eid}", t)
+                for eid, t in entries[start + 1:]
+            ]
+            queue_pos, queue_total = start + 1, len(entries)
+            url_used = f"https://www.youtube.com/watch?v={entries[start][0]}"
+            print(f"Playlist: Video {queue_pos}/{queue_total}, {len(queue)} folgen")
+        print("Hole Video-Info (nur kleine Metadaten-Anfragen, alle Clients parallel) ...")
+        _infos, sels = youtube_info(url_used)
+        prog = ProgressiveLoad(sels)
+        prog.start()
+        frames = prog.frames
+        fps = prog.fps
+        path = prog.video_dl.path()
+        sel = sels[0]
+        meta = {
+            "title": sel.get("title") or "", "id": sel.get("id") or "",
+            "duration": sel.get("duration") or 0, "fps": fps,
+            "width": sel.get("width") or 0, "height": sel.get("height") or 0,
+            "source": url_used, "client": sel.get("client") or "",
+        }
+    else:
+        print("Loading into RAM ...")
+        data = fetch_bytes(src)
+        if looks_like_url(src):
+            url_used = src
+        path = to_memfd(data)
+        fps = probe_fps(path)
+        print("Decoding ...")
+        frames = decode_frames(path)
+        if not frames and url_used:
+            # direct download was no playable video (e.g. HTML page) -> yt-dlp
+            print("Direkter Download nicht dekodierbar, versuche yt-dlp ...")
+            _infos, sels = youtube_info(url_used)
+            prog = ProgressiveLoad(sels)
+            prog.start()
+            frames = prog.frames
+            fps = prog.fps
+            path = prog.video_dl.path()
+            sel = sels[0]
+            meta = {
+                "title": sel.get("title") or "", "id": sel.get("id") or "",
+                "duration": sel.get("duration") or 0, "fps": fps,
+                "width": sel.get("width") or 0, "height": sel.get("height") or 0,
+                "source": url_used, "client": sel.get("client") or "",
+            }
+        if prog is None and not frames:
+            sys.exit("No video frames found (not a playable video?).")
+        if prog is None:
+            print(f"Loaded {len(frames)} frames @ {fps:.3f} fps")
+
+    root = tk.Tk()
+    root.configure(bg="black")
+    state = {
+        "idx": 0, "playing": False, "fps": fps, "photo": None,
+        "zoom": None,  # None = auto-fit, otherwise explicit scale factor
+        "pan_x": 0.0, "pan_y": 0.0, "cur_img": None,
+        "item": None, "crop_ox": 0.0, "crop_oy": 0.0,
+        "crop_vw": 1.0, "crop_vh": 1.0, "render_job": None,
+        "video_bytes": data, "ytdlp_bytes": ytdlp_data, "meta": meta,
+        "queue": queue, "queue_pos": queue_pos, "queue_total": queue_total,
+        "volume": 50, "audio": None, "audio_path": None,
+        "audio_loading": False, "audio_missing": False,
+        "ffplay": None, "gen": 0, "prog": prog,
+        "prog_applied": prog is None, "quit_after_export": False,
+        "tl_frames": 0, "ffplay_start": 0.0,
+    }
+
+    if ytdlp_data is not None and meta and meta.get("ytdlp"):
+        # reuse the yt-dlp bundle stored in the project instead of re-downloading
+        stored = meta.get("ytdlp")
+        if stored == "yt-dlp":  # pure-RAM zipapp
+            _YTDLP.update(
+                path=to_memfd(ytdlp_data, b"yt-dlp"),
+                data=ytdlp_data, run_with=[sys.executable], name=stored,
+            )
+        else:  # platform PyInstaller binary -> /dev/shm (RAM)
+            _YTDLP.update(
+                path=ram_exec_path(ytdlp_data, "yt-dlp"),
+                data=ytdlp_data, run_with=None, name=stored,
+            )
+
+    # ------------------- widgets: video canvas, timeline, status bar -----------
+
+    status_frame = tk.Frame(root, bg="#111111")
+    status_frame.pack(side="bottom", fill="x")
+    bar = tk.Canvas(status_frame, height=8, bg="#111111", highlightthickness=0)
+    bar.pack(fill="x", padx=2, pady=(2, 0))
+    bar.create_rectangle(2, 1, 2, 7, fill="#cc3333", outline="", tags="fill")
+    status_label = tk.Label(status_frame, text="", bg="#111111", fg="#bbbbbb",
+                            font=("TkDefaultFont", 9), anchor="w")
+    status_label.pack(fill="x", padx=4)
+
+    tl_frame = tk.Frame(root, bg="#111111")
+    tl_frame.pack(side="bottom", fill="x")
+    tl_remaining = tk.Label(tl_frame, text="-0:00", bg="#111111", fg="#bbbbbb",
+                            font=("TkDefaultFont", 9), width=9, anchor="e")
+    tl_remaining.pack(side="left", padx=(4, 0))
+    timeline = tk.Canvas(tl_frame, bg="#111111", height=14, highlightthickness=0, cursor="hand2")
+    timeline.pack(side="left", fill="x", expand=True)
+    tl_elapsed = tk.Label(tl_frame, text="0:00", bg="#111111", fg="#bbbbbb",
+                          font=("TkDefaultFont", 9), width=9, anchor="w")
+    tl_elapsed.pack(side="left", padx=(0, 4))
+    canvas = tk.Canvas(root, bg="black", highlightthickness=0)
+    canvas.pack(fill="both", expand=True)
+
+    if prog is None:
+        first = Image.open(io.BytesIO(frames[0])).convert("RGB")
+        vid_w, vid_h = first.size
+        state["cur_img"] = first
+    else:
+        vid_w = int(meta.get("width") or 640) or 640
+        vid_h = int(meta.get("height") or 360) or 360
+    init_w = min(vid_w, root.winfo_screenwidth() - 40)
+    init_h = min(vid_h, root.winfo_screenheight() - 120)
+    root.geometry(f"{init_w}x{init_h}")
+    try:
+        root.state("zoomed")
+    except Exception:
+        root.geometry(f"{root.winfo_screenwidth()}x{root.winfo_screenheight()}")
+
+    # ------------------- timeline (seek bar under the video) -------------------
+
+    def timeline_setup():
+        timeline.delete("bg")
+        w = max(timeline.winfo_width(), 10)
+        timeline.create_rectangle(2, 4, w - 2, 10, fill="#333333", outline="", tags="bg")
+        timeline.create_rectangle(2, 4, 2, 10, fill="#cc3333", outline="", tags="bg_play")
+
+    def fmt_time(secs):
+        secs = max(0, int(round(secs)))
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+    def timeline_update():
+        w = timeline.winfo_width()
+        if w < 10:
+            return
+        fr = state["idx"] / max(1, len(frames) - 1)
+        timeline.coords("bg_play", 2, 4, 2 + fr * (w - 4), 10)
+        total = max(0.0, (len(frames) - 1) / fps)
+        played = state["idx"] / fps
+        tl_remaining.config(text="-" + fmt_time(total - played))
+        tl_elapsed.config(text=fmt_time(played))
+
+    def tl_seek(event):
+        w = timeline.winfo_width()
+        if w < 10:
+            return
+        fr = max(0.0, min(1.0, (event.x - 2) / max(1, w - 4)))
+        idx = int(round(fr * (len(frames) - 1)))
+        if idx != state["idx"]:
+            state["idx"] = idx
+            invalidate_image()
+            render()
+            restart_audio_if_playing()
+
+    def tl_press(event):
+        state["tl_drag"] = True
+        tl_seek(event)
+
+    def tl_drag(event):
+        if state.get("tl_drag"):
+            tl_seek(event)
+
+    def tl_release(_event=None):
+        state.pop("tl_drag", None)
+
+    # ------------------- audio (extracted to RAM, played via ffplay) ----------
+
+    def start_progressive_audio(prog):
+        """Ton schon waehrend des Downloads: inkrementelle ADTS-Paesse in einen
+        RAM-FIFO (/dev/shm), den ffplay live abspielt (combined & separate)."""
+        state["audio_stop"] = False
+        state["audio_ready"] = False
+        state["audio_loading"] = True
+        gen = state.get("audio_gen", 0)
+        state["audio_gen"] = gen + 1
+        fifo = f"/dev/shm/povideo_audio_{os.getpid()}_{gen}.fifo"
+        try:
+            os.unlink(fifo)
+        except OSError:
+            pass
+        os.mkfifo(fifo)
+        state["audio_fifo"] = fifo
+        fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            import fcntl
+            fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, 1 << 20)
+        except Exception:
+            pass
+        stop_audio(state["ffplay"])
+        state["ffplay"] = start_audio(fifo, state["volume"])
+        state["ffplay_start"] = time.time()
+
+        def stop_check():
+            return state.get("audio_stop")
+
+        def run():
+            src = None
+            last = max(0.0, state["idx"] / fps - 0.05)
+            dur = 0.0
+            done_full = False
+            try:
+                while not stop_check():
+                    cur = (prog.audio_dl if (prog.audio_dl is not None
+                                             and not prog.audio_dl.error)
+                           else prog.video_dl)
+                    if cur is None or cur.error:
+                        state["audio_missing"] = True
+                        break
+                    if cur is not src:
+                        src = cur
+                        last = max(0.0, state["idx"] / fps - 0.05)
+                        dur = 0.0
+                        done_full = False
+                    if dur <= 0.0:
+                        dur = probe_duration(src.path())
+                    tgt = state["idx"] / fps
+                    if abs(tgt - last) > 2.0:
+                        last = max(0.0, tgt - 0.05)
+                    written = src.written
+                    if dur > 0.0 and written >= 4 * 1024 * 1024:
+                        if src.done:
+                            end_t = dur
+                        else:
+                            end_t = written / src.total * dur - 0.5
+                        if end_t - last >= 1.0:
+                            out_t = _audio_pass(src.path(), last, end_t - last,
+                                                fd, stop_check)
+                            if out_t > 0.0:
+                                last = out_t + 0.05
+                                state["audio_ready"] = True
+                            time.sleep(0.2)
+                    elif src.done and not done_full:
+                        # moov/dauration nicht ermittelbar: einmalig komplett
+                        done_full = True
+                        out = extract_audio(src.path())
+                        if out:
+                            _write_fifo(fd, out, stop_check)
+                            state["audio_ready"] = True
+                    time.sleep(0.4)
+            except Exception:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(fifo)
+            except OSError:
+                pass
+            state["audio_loading"] = False
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def ensure_audio():
+        """Get the audio track in a background thread (once per video)."""
+        if state["audio_path"] is not None or state["audio_loading"] or state["audio_missing"]:
+            return
+        prog = state.get("prog")
+        if prog is not None and not prog.error and prog.video_dl is not None:
+            start_progressive_audio(prog)
+            return
+        gen = state["gen"]
+        state["audio_loading"] = True
+
+        def spawn(ap):
+            stop_audio(state["ffplay"])
+            state["ffplay"] = start_audio(ap, state["volume"])
+            state["ffplay_start"] = time.time()
+
+        def work():
+            ap = None
+            try:
+                if prog is not None:
+                    if prog.audio_dl is not None:
+                        # separate audio stream: play the m4a directly, no re-encode
+                        if prog.audio_dl.done and not prog.audio_dl.error:
+                            ap = prog.audio_dl.path()
+                    elif prog.video_dl.done and not prog.video_dl.error:
+                        # combined format: extract audio after the full download
+                        aud = extract_audio(prog.video_dl.path())
+                        ap = to_memfd(aud, b"povideo_audio") if aud else None
+                else:
+                    aud = extract_audio(path)
+                    ap = to_memfd(aud, b"povideo_audio") if aud else None
+            except Exception:
+                ap = None
+            if ap is None:
+                # only give up for good if there is nothing left to wait for
+                waiting = prog is not None and (
+                    (prog.audio_dl is not None
+                     and not prog.audio_dl.done and not prog.audio_dl.error)
+                    or (prog.audio_dl is None and not prog.video_dl.done)
+                )
+                if not waiting:
+                    state["audio_missing"] = True
+            elif state["gen"] == gen and state["playing"]:
+                state["audio_path"] = ap
+                spawn(ap)
+            state["audio_loading"] = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def start_playback_audio():
+        if state["audio_path"]:
+            stop_audio(state["ffplay"])
+            state["ffplay"] = start_audio(state["audio_path"], state["volume"])
+            state["ffplay_start"] = time.time()
+        elif state.get("audio_fifo") and state.get("audio_loading"):
+            stop_audio(state["ffplay"])
+            state["ffplay"] = start_audio(state["audio_fifo"], state["volume"],
+                                          ss=state["idx"] / fps)
+            state["ffplay_start"] = time.time()
+        else:
+            ensure_audio()
+
+    def stop_playback_audio():
+        state["audio_stop"] = True
+        stop_audio(state["ffplay"])
+        state["ffplay"] = None
+
+    def restart_audio_if_playing():
+        if state["playing"]:
+            start_playback_audio()
+
+    def vol_up(_event=None):
+        state["volume"] = min(300, state["volume"] + 10)
+        restart_audio_if_playing()
+        render()
+
+    def vol_down(_event=None):
+        state["volume"] = max(0, state["volume"] - 10)
+        restart_audio_if_playing()
+        render()
+
+    # ------------------- video switching (playlist queue) ---------------------
+
+    def apply_video(nprog, nsel, title):
+        nonlocal frames, vid_w, vid_h, path, fps, meta
+        old = state.get("prog")
+        if old is not None:
+            old.stop()
+        frames = nprog.frames
+        fps = nprog.fps
+        path = nprog.video_dl.path()
+        meta = {
+            "title": nsel.get("title") or title, "id": nsel.get("id") or "",
+            "duration": nsel.get("duration") or 0, "fps": fps,
+            "width": nsel.get("width") or 0, "height": nsel.get("height") or 0,
+            "source": (state.get("meta") or {}).get("source") or "",
+            "client": nsel.get("client") or "",
+        }
+        state["idx"] = 0
+        state["zoom"] = None
+        state["pan_x"] = state["pan_y"] = 0.0
+        state["cur_img"] = None
+        state["video_bytes"] = None
+        state["meta"] = meta
+        state["gen"] += 1
+        state["audio"] = None
+        state["audio_path"] = None
+        state["audio_loading"] = False
+        state["audio_missing"] = False
+        state["audio_ready"] = False
+        state["audio_fifo"] = None
+        state["prog"] = nprog
+        state["prog_applied"] = True
+        stop_playback_audio()
+        first = Image.open(io.BytesIO(frames[0])).convert("RGB")
+        vid_w, vid_h = first.size
+        timeline_setup()
+        render()
+        root.title(f"povideo - {state['queue_pos']}/{state['queue_total']}: {title} ({len(frames)} Frames)")
+        if state["playing"]:
+            start_playback_audio()
+            step()
+
+    def next_video(_event=None):
+        if not state["queue"]:
+            return
+        stop_playback_audio()
+        url, title = state["queue"].pop(0)
+        state["queue_pos"] += 1
+        root.title(f"povideo - lade naechstes Video ({state['queue_pos']}/{state['queue_total']}): {title} ...")
+
+        def work():
+            try:
+                _infos, nsel_list = youtube_info(url)
+                nprog = ProgressiveLoad(nsel_list)
+                nprog.start()
+                deadline = time.time() + 180
+                while (not nprog.frames and not nprog.error
+                       and time.time() < deadline):
+                    time.sleep(0.5)
+                if nprog.error:
+                    raise ValueError(nprog.error)
+                if not nprog.frames:
+                    raise ValueError("keine Frames erhalten")
+                root.after(0, lambda: apply_video(nprog, nprog.sel, title))
+            except Exception as e:
+                root.after(0, lambda: root.title(f"povideo - Video '{title}' fehlgeschlagen: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def current_fit():
+        w, h = canvas.winfo_width(), canvas.winfo_height()
+        if w < 10 or h < 10:
+            return 1.0
+        return min(w / vid_w, h / vid_h)
+
+    def current_image():
+        if state["cur_img"] is None:
+            state["cur_img"] = (
+                Image.open(io.BytesIO(frames[state["idx"]])).convert("RGB")
+            )
+        return state["cur_img"]
+
+    def make_photo(img, scale):
+        if scale == 1.0:
+            return ImageTk.PhotoImage(img)
+        resample = Image.NEAREST if scale > 1.0 else Image.BILINEAR
+        w = max(1, int(vid_w * scale))
+        h = max(1, int(vid_h * scale))
+        return ImageTk.PhotoImage(img.resize((w, h), resample))
+
+    def set_photo(photo, cx, cy):
+        if state["item"] is None:
+            state["item"] = canvas.create_image(cx, cy, image=photo)
+        else:
+            canvas.coords(state["item"], cx, cy)
+            canvas.itemconfig(state["item"], image=photo)
+        state["photo"] = photo
+
+    def clamp_pan():
+        s = state["zoom"]
+        win_w, win_h = canvas.winfo_width(), canvas.winfo_height()
+        if win_w < 10 or win_h < 10:
+            win_w, win_h = vid_w, vid_h
+        max_px = max(0.0, vid_w / 2 - win_w / (2 * s))
+        max_py = max(0.0, vid_h / 2 - win_h / (2 * s))
+        state["pan_x"] = max(-max_px, min(max_px, state["pan_x"]))
+        state["pan_y"] = max(-max_py, min(max_py, state["pan_y"]))
+
+    def render():
+        if not frames:
+            return
+        img = current_image()
+        win_w, win_h = canvas.winfo_width(), canvas.winfo_height()
+        if win_w < 10 or win_h < 10:
+            win_w, win_h = vid_w, vid_h
+
+        if state["zoom"] is None:
+            scale = min(win_w / vid_w, win_h / vid_h)
+            photo = make_photo(img, scale)
+            set_photo(photo, win_w / 2, win_h / 2)
+            state["crop_ox"] = state["crop_oy"] = 0.0
+            state["crop_vw"], state["crop_vh"] = vid_w, vid_h
+        else:
+            s = state["zoom"]
+            if s * vid_w < win_w or s * vid_h < win_h:
+                # zoomed out further than the window: plain full-image scale
+                photo = make_photo(img, s)
+                set_photo(photo, win_w / 2, win_h / 2)
+                state["crop_ox"] = state["crop_oy"] = 0.0
+                state["crop_vw"], state["crop_vh"] = vid_w, vid_h
+            else:
+                # crop-based zoom with a margin around the visible window,
+                # so panning only re-renders when crossing the margin edge
+                clamp_pan()
+                m = 1.6
+                rw, rh = win_w * m, win_h * m
+                vw, vh = rw / s, rh / s
+                cx = vid_w / 2 + state["pan_x"]
+                cy = vid_h / 2 + state["pan_y"]
+                ox = max(0, min(int(cx - vw / 2), int(vid_w - vw)))
+                oy = max(0, min(int(cy - vh / 2), int(vid_h - vh)))
+                crop = img.crop((ox, oy, ox + vw, oy + vh))
+                photo = ImageTk.PhotoImage(
+                    crop.resize((int(rw), int(rh)), Image.NEAREST)
+                )
+                set_photo(photo, win_w / 2, win_h / 2)
+                state["crop_ox"], state["crop_oy"] = ox, oy
+                state["crop_vw"], state["crop_vh"] = vw, vh
+
+        scale_shown = state["zoom"] if state["zoom"] is not None else min(
+            win_w / vid_w, win_h / vid_h
+        )
+        timeline_update()
+        pos = ""
+        if state["queue_total"] > 1:
+            pos = f"[{state['queue_pos']}/{state['queue_total']}] "
+        root.title(
+            f"povideo - {pos}frame {state['idx'] + 1}/{len(frames)}  "
+            f"{scale_shown * 100:.0f}%  vol {state['volume']}%"
+        )
+
+    def invalidate_image():
+        state["cur_img"] = None
+        state["pan_x"] = 0.0
+        state["pan_y"] = 0.0
+
+    def next_frame(_event=None):
+        if state["idx"] < len(frames) - 1:
+            state["idx"] += 1
+            invalidate_image()
+            render()
+            restart_audio_if_playing()
+
+    def prev_frame(_event=None):
+        if state["idx"] > 0:
+            state["idx"] -= 1
+            invalidate_image()
+            render()
+            restart_audio_if_playing()
+
+    def zoom_in(_event=None):
+        if state["zoom"] is None:
+            state["zoom"] = current_fit()
+        state["zoom"] = min(16.0, state["zoom"] * 1.25)
+        state["pan_x"] = state["pan_y"] = 0.0
+        schedule_render()
+
+    def zoom_out(_event=None):
+        if state["zoom"] is None:
+            state["zoom"] = current_fit()
+        state["zoom"] = max(0.05, state["zoom"] / 1.25)
+        state["pan_x"] = state["pan_y"] = 0.0
+        schedule_render()
+
+    def fit(_event=None):
+        state["zoom"] = None
+        state["pan_x"] = state["pan_y"] = 0.0
+        render()
+
+    def schedule_render():
+        # coalesce bursts of events (e.g. fast wheel scrolling) into one render
+        if state["render_job"] is None:
+            state["render_job"] = root.after(16, do_pending_render)
+
+    def do_pending_render():
+        state["render_job"] = None
+        render()
+
+    def pan_start(event):
+        state["last_mouse"] = (event.x, event.y)
+
+    def press_left(event):
+        # left click = next frame, left drag = pan (like a normal image viewer)
+        state["lmb_down"] = (event.x, event.y)
+        state["lmb_moved"] = False
+
+    def drag_left(event):
+        if state["zoom"] is None or "lmb_down" not in state:
+            return
+        dx = event.x - state["lmb_down"][0]
+        dy = event.y - state["lmb_down"][1]
+        if abs(dx) + abs(dy) <= 4:
+            return
+        state["lmb_moved"] = True
+        if "last_mouse" not in state:
+            state["last_mouse"] = state["lmb_down"]
+        pan_move(event)
+
+    def release_left(_event=None):
+        if "lmb_down" in state and not state["lmb_moved"]:
+            next_frame()
+        state.pop("lmb_down", None)
+        state.pop("lmb_moved", None)
+        state.pop("last_mouse", None)
+
+    def pan_move(event):
+        if state["zoom"] is None or "last_mouse" not in state:
+            return
+        s = state["zoom"]
+        win_w, win_h = canvas.winfo_width(), canvas.winfo_height()
+        if win_w < 10 or win_h < 10:
+            win_w, win_h = vid_w, vid_h
+        dx = event.x - state["last_mouse"][0]
+        dy = event.y - state["last_mouse"][1]
+        state["last_mouse"] = (event.x, event.y)
+        if dx == 0 and dy == 0:
+            return
+
+        new_px = state["pan_x"] - dx / s
+        new_py = state["pan_y"] - dy / s
+        max_px = max(0.0, vid_w / 2 - win_w / (2 * s))
+        max_py = max(0.0, vid_h / 2 - win_h / (2 * s))
+        if new_px < -max_px or new_px > max_px or new_py < -max_py or new_py > max_py:
+            return  # reached the video edge
+
+        # move the rendered image directly on the canvas (no re-render)
+        canvas.move(state["item"], dx, dy)
+        state["pan_x"] = new_px
+        state["pan_y"] = new_py
+
+        # re-render only when the viewport leaves the rendered margin
+        cxo = state["crop_ox"] + state["crop_vw"] / 2
+        cyo = state["crop_oy"] + state["crop_vh"] / 2
+        vcx = vid_w / 2 + state["pan_x"]
+        vcy = vid_h / 2 + state["pan_y"]
+        margin_vw = state["crop_vw"] / 2 - win_w / (2 * s)
+        margin_vh = state["crop_vh"] / 2 - win_h / (2 * s)
+        if abs(vcx - cxo) > margin_vw or abs(vcy - cyo) > margin_vh:
+            render()
+
+    def step():
+        if not state["playing"]:
+            return
+        if state["idx"] < len(frames) - 1:
+            state["idx"] += 1
+            invalidate_image()
+            render()
+            root.after(int(1000 / state["fps"]), step)
+        else:
+            prog = state.get("prog")
+            if prog is not None and not prog.done and not prog.error:
+                # progressive download: wait for the next frames to arrive
+                root.after(100, step)
+            elif state["queue"]:
+                next_video()  # auto-play the next playlist video
+            else:
+                state["playing"] = False
+                stop_playback_audio()
+
+    def toggle(_event=None):
+        state["playing"] = not state["playing"]
+        if state["playing"]:
+            start_playback_audio()
+            step()
+        else:
+            stop_playback_audio()
+
+    def on_resize(_event=None):
+        size = (canvas.winfo_width(), canvas.winfo_height())
+        if size != last_size[0]:
+            last_size[0] = size
+            state["zoom"] = None  # re-align the video to the new window size
+            state["pan_x"] = state["pan_y"] = 0.0
+            render()
+
+    last_size = [(canvas.winfo_width(), canvas.winfo_height())]
+
+    # ------------------- project export -------------------
+
+    export_result = [None]
+
+    def current_video_bytes():
+        """Video bytes for export: from the RAM memfd once the progressive
+        download is complete (avoids doubling RAM), else the loaded bytes."""
+        prog = state.get("prog")
+        if prog is not None:
+            dl = prog.video_dl
+            if not dl.done or dl.error:
+                return None
+            os.lseek(dl.fd, 0, 0)
+            return os.read(dl.fd, dl.total)
+        return state.get("video_bytes")
+
+    def export_project(_event=None):
+        vbytes = current_video_bytes()
+        if vbytes is None:
+            root.title("povideo - Export erst moeglich, wenn der Download fertig ist")
+            return
+        state["playing"] = False
+        stop_playback_audio()
+        out = filedialog.asksaveasfilename(
+            title="povideo Projekt speichern (nur povideo kann es oeffnen)",
+            defaultextension=".pov",
+            filetypes=[("povideo Projekt", "*.pov")],
+        )
+        if not out:
+            state["quit_after_export"] = False
+            return
+        root.title(f"povideo - exportiere Projekt nach {os.path.basename(out)} ...")
+        snap = {
+            "idx": state["idx"],
+            "zoom": state["zoom"],
+            "pan": [state["pan_x"], state["pan_y"]],
+            "fps": state["fps"],
+            "video_w": vid_w,
+            "video_h": vid_h,
+            "total_frames": len(frames),
+            "frame": frames[state["idx"]],
+            "video": vbytes,
+            "ytdlp": _YTDLP.get("data"),
+            "ytdlp_name": _YTDLP.get("name"),
+            "meta": dict(state.get("meta") or {}),
+            "queue": [list(q) for q in state["queue"]],
+            "queue_pos": state["queue_pos"],
+            "queue_total": state["queue_total"],
+        }
+
+        def work():
+            try:
+                meta = dict(snap["meta"])
+                meta.update({
+                    "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "frame": snap["idx"],
+                    "zoom": snap["zoom"],
+                    "pan": snap["pan"],
+                    "fps": snap["fps"],
+                    "video_w": snap["video_w"],
+                    "video_h": snap["video_h"],
+                    "total_frames": snap["total_frames"],
+                    "video_bytes": len(snap["video"]),
+                    "ytdlp": snap["ytdlp_name"],
+                    "format": _VERSION,
+                    "queue": snap["queue"],
+                    "queue_pos": snap["queue_pos"],
+                    "queue_total": snap["queue_total"],
+                    "youtube": bool(snap["meta"].get("source")),
+                })
+                save_project_file(
+                    out, meta, snap["video"],
+                    snap["ytdlp"] or b"", snap["frame"],
+                )
+                export_result[0] = f"povideo - Projekt gespeichert: {os.path.basename(out)}"
+            except Exception as e:
+                export_result[0] = f"povideo - EXPORT FEHLER: {e}"
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def poll_export():
+        if export_result[0] is not None:
+            root.title(export_result[0])
+            if state.get("quit_after_export") and "gespeichert" in export_result[0]:
+                root.after(300, root.destroy)
+        else:
+            root.after(200, poll_export)
+
+    def maybe_apply_prog():
+        """First progressive frames arrived: show them and start playback."""
+        prog = state.get("prog")
+        if prog is None or state["prog_applied"] or not prog.frames:
+            return
+        state["prog_applied"] = True
+        nonlocal vid_w, vid_h
+        first = Image.open(io.BytesIO(prog.frames[0])).convert("RGB")
+        vid_w, vid_h = first.size
+        state["cur_img"] = first
+        timeline_setup()
+        render()
+        if state["playing"]:
+            start_playback_audio()
+
+    def poll_download():
+        prog = state.get("prog")
+        if prog is not None:
+            maybe_apply_prog()
+            dl = prog.video_dl
+            err = dl.error or prog.error
+            w = bar.winfo_width()
+            if err:
+                status_label.config(text=f"FEHLER: {err}")
+                bar.coords("fill", 2, 1, max(w - 2, 3), 7)
+            elif dl.done:
+                status_label.config(
+                    text=f"Video komplett im RAM ({len(prog.frames)} Frames)")
+                bar.coords("fill", 2, 1, max(w - 2, 3), 7)
+            else:
+                pct = (dl.written / dl.total * 100) if dl.total else 0.0
+                spd = f"{dl.speed / 1e6:.1f} MB/s"
+                eta = ""
+                if dl.eta is not None:
+                    eta = f"  noch {int(dl.eta // 60)}:{int(dl.eta % 60):02d} min"
+                t = (f"Video {pct:.1f}%  ({dl.written / 1e6:.0f}/"
+                     f"{(dl.total or 0) / 1e6:.0f} MB)  {spd}{eta}")
+                adl = prog.audio_dl
+                if state.get("audio_ready"):
+                    t += "   |   Audio laeuft"
+                elif state["audio_loading"]:
+                    t += "   |   Audio wird geladen ..."
+                elif adl is not None and not adl.done and not adl.error:
+                    apct = (adl.written / adl.total * 100) if adl.total else 0.0
+                    t += f"   |   Audio {apct:.0f}%"
+                elif adl is None and not dl.done:
+                    t += "   |   Audio folgt nach dem Video-Download"
+                t += f"   |   Frames: {len(prog.frames)}"
+                status_label.config(text=t)
+                if w > 4 and dl.total:
+                    bar.coords("fill", 2, 1, 2 + pct / 100.0 * (w - 4), 7)
+        # timeline keeps moving while progressive frames grow
+        if state["playing"] and state.get("prog") is not None:
+            if len(frames) != state.get("tl_frames"):
+                state["tl_frames"] = len(frames)
+                timeline_update()
+        # audio died (ffplay ended) but video is still playing -> restart
+        if state["playing"] and state["ffplay"] is not None and state["ffplay"].poll() is not None:
+            died_after = time.time() - state.get("ffplay_start", 0)
+            state["ffplay"] = None
+            if died_after > 2.0:
+                if state["audio_path"]:
+                    state["ffplay"] = start_audio(state["audio_path"], state["volume"])
+                elif state.get("audio_fifo") and state.get("audio_loading"):
+                    state["ffplay"] = start_audio(state["audio_fifo"], state["volume"],
+                                                  ss=state["idx"] / fps)
+                else:
+                    ensure_audio()
+                state["ffplay_start"] = time.time()
+            elif state.get("audio_loading") and state.get("audio_fifo"):
+                state["ffplay"] = start_audio(state["audio_fifo"], state["volume"],
+                                              ss=state["idx"] / fps)
+                state["ffplay_start"] = time.time()
+            else:
+                state["audio_missing"] = True  # broken file: don't loop restarts
+        # start audio as soon as it becomes available (progressive videos)
+        if state["playing"] and state["audio_path"] is None and not state["audio_loading"]:
+            ensure_audio()
+        root.after(500, poll_download)
+
+    def quit_app(_event=None):
+        stop_playback_audio()
+        root.destroy()
+
+    def do_quit(_event=None):
+        stop_playback_audio()
+        root.destroy()
+
+    def save_and_quit(_event=None):
+        if current_video_bytes() is None:
+            root.title("povideo - Download noch nicht fertig: Speichern nicht moeglich. [q] = trotzdem beenden")
+            return
+        state["quit_after_export"] = True
+        export_project()
+
+    def confirm_quit(_event=None):
+        state["playing"] = False
+        stop_playback_audio()
+        root.bind("<q>", do_quit)
+        root.bind("<a>", save_and_quit)
+        root.title("povideo - Projekt speichern? [a] ja, [q] nein")
+
+    timeline.bind("<Button-1>", tl_press)
+    timeline.bind("<B1-Motion>", tl_drag)
+    timeline.bind("<ButtonRelease-1>", tl_release)
+    root.bind("<Button-1>", press_left)
+    root.bind("<B1-Motion>", drag_left)
+    root.bind("<ButtonRelease-1>", release_left)
+    root.bind("<Button-3>", prev_frame)
+    root.bind("<Button-4>", zoom_in)
+    root.bind("<Button-5>", zoom_out)
+    root.bind("<Button-2>", pan_start)
+    root.bind("<B2-Motion>", pan_move)
+    root.bind("<space>", toggle)
+    root.bind("<Left>", prev_frame)
+    root.bind("<Right>", next_frame)
+    root.bind("<f>", fit)
+    root.bind("<e>", export_project)
+    root.bind("<n>", next_video)
+    root.bind("+", vol_up)
+    root.bind("=", vol_up)
+    root.bind("-", vol_down)
+    root.bind("<q>", confirm_quit)
+    root.bind("<Escape>", confirm_quit)
+    root.bind("<Configure>", on_resize)
+    root.focus_set()
+
+    # restore saved state from a project file (only for .pov, not progressive)
+    if meta and not prog:
+        if "frame" in meta:
+            state["idx"] = min(max(int(meta["frame"]), 0), len(frames) - 1)
+        if meta.get("zoom") is not None:
+            state["zoom"] = float(meta["zoom"])
+            state["pan_x"], state["pan_y"] = (float(meta.get("pan", [0, 0])[0]), float(meta.get("pan", [0, 0])[1]))
+        q = meta.get("queue")
+        if isinstance(q, list):
+            state["queue"] = [(u, t) for u, t in q
+                              if isinstance(u, str) and isinstance(t, str)]
+            state["queue_pos"] = int(meta.get("queue_pos") or 1)
+            state["queue_total"] = int(meta.get("queue_total") or max(1, state["queue_pos"]))
+        if meta.get("title") and meta.get("source"):
+            root.title(f"povideo - Projekt geladen: {meta.get('title')} (frame {state['idx'] + 1}/{len(frames)})")
+        else:
+            root.title(f"povideo - Projekt geladen (frame {state['idx'] + 1}/{len(frames)})")
+
+    timeline_setup()
+    render()
+    root.title("povideo: links-drag=pan, wheel=zoom, links-click=naechster Frame, rechts=zurueck, space=play, Timeline=seek, +/= lauter (bis 300%), -=leiser, n=naechstes Video, e=export, q=speichern-fragen + beenden")
+    root.after(4000, render)
+    root.after(200, poll_export)
+    root.after(500, poll_download)
+    root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

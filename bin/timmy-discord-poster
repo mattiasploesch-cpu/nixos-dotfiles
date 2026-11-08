@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""timmy-discord-poster v2
+- #stats: EIN öffentlicher Indikator-Nachricht wird EDITIERT (Bot online? / wer darf posten?)
+- #stats-private: detailliertes Status-Board (Edit einer Single-Message, keine Flut)
+- #logs: Log-Auszüge (Edit der letzten Poster-Nachricht wenn noch jung, sonst neue)
+Poster läuft als systemd-User-Service mit Timer (5 Min)."""
+import json, os, subprocess, datetime, time, urllib.request, urllib.error
+
+TOK = "MTU1OTE5MDI1MjQ0MTA0Mjk0NA.G913Ol.s_8xx0Nq7I7zNk55TdjMojOlUssw56vUqMN8X0"
+STATE = "/home/administrator/.local/share/timmy-poster-state.json"
+GUILD = "1265591706032668684"
+CHANNELS_CACHE = "/home/administrator/.local/share/timmy-log-channels.json"
+
+UA = "DiscordBot (https://dein-bot, 1.0)"
+
+def api(path, method="GET", data=None):
+    req = urllib.request.Request("https://discord.com/api/v10" + path,
+        data=json.dumps(data).encode() if data else None, method=method,
+        headers={"Authorization": "Bot " + TOK, "Content-Type": "application/json", "User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = r.read()
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as e:
+        return {"_error": e.code, "_body": e.read().decode()[:200]}
+    except Exception as ee:
+        return {"_error": -1, "_body": str(ee)}
+
+def curl_json(path, method="GET", data=None):
+    args = ["curl", "-s", "-m", "20", "-X", method,
+            "-H", f"Authorization: Bot {TOK}",
+            "-H", "Content-Type: application/json"]
+    inp = None
+    if data:
+        args += ["-d", json.dumps(data)]
+    args.append("https://discord.com/api/v10" + path)
+    out = subprocess.run(args, input=inp, capture_output=True, text=True).stdout
+    try: return json.loads(out)
+    except Exception: return {}
+
+def resolve_channels():
+    if os.path.exists(CHANNELS_CACHE):
+        cached = json.load(open(CHANNELS_CACHE))
+        if cached.get("ts", 0) > time.time() - 3600 and cached.get("stats_private"):
+            return cached
+    out = subprocess.run(["curl","-s","-m","15","-H",f"Authorization: Bot {TOK}",
+        f"https://discord.com/api/v10/guilds/{GUILD}/channels"], capture_output=True,text=True).stdout
+    chans = json.loads(out) if out else []
+    res = {"stats": None, "logs": None, "stats_private": None, "ts": time.time()}
+    if isinstance(chans, list):
+        for c in chans:
+            n, t = c.get("name"), c.get("type")
+            if t != 0: continue
+            if n == "stats": res["stats"] = c["id"]
+            elif n == "logs": res["logs"] = c["id"]
+            elif n == "stats-private": res["stats_private"] = c["id"]
+    json.dump(res, open(CHANNELS_CACHE, "w"))
+    return res
+
+def sh(cmd):
+    try: return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception: return ""
+
+def board_text():
+    now = datetime.datetime.now().strftime("%d.%m. %Y %H:%M")
+    def svc(u):
+        return "🟢 running" if sh(f"systemctl --user is-active {u}") == "active" else "🔴 FAILED"
+    cpu = sh("uptime").split("load average:")[-1].strip()
+    mem = sh("free -h --si | awk '/Mem:/{print $3\" / \"$2}'")
+    disk = sh("df -h / | awk 'NR==2{print $3\" / \"$2\" (\"$5\")\"}'")
+    up = sh("uptime -p")
+    inbox = sh(f"journalctl --user -u openclaw-gateway --since '60 minutes ago' --no-pager | grep -ciE 'Inbound message'")
+    sent = sh(f"journalctl --user -u openclaw-gateway --since '60 minutes ago' --no-pager | grep -ciE 'Sent message'")
+    err = sh(f"journalctl --user -u openclaw-gateway -u llama-chat -u llama-vision -u llama-embed --since '60 minutes ago' --no-pager | grep -ciaE 'error|failed'")
+    return (f"🤖 **timmy Status Board** *(updated {now} — Zeitzone Europe/Berlin)*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"**Models**\n"
+            f"• Chat `timmy-ai` :8597 — {svc('llama-chat')}\n"
+            f"• Vision `timmy-ai-vision` :8598 — {svc('llama-vision')}\n"
+            f"• Memory `timmy-ai-embed` :8599 — {svc('llama-embed')}\n"
+            f"• Gateway — {svc('openclaw-gateway')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"**Channels**  (🟢 = active)\n"
+            f"• WhatsApp — Listening\n"
+            f"• Telegram @MattisOpenclawBot — Polling\n"
+            f"• Discord @matthias-chatbot — Connected\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"**Hardware**\n"
+            f"• Load `{cpu}` · RAM `{mem}` · Disk `{disk}`\n"
+            f"• Uptime: {up}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"**Last hour**\n"
+            f"• Messages in: {inbox or 0} · out: {sent or 0} · Errors: {err or 0}")
+
+def public_text():
+    ok = all(sh(f"systemctl --user is-active {u}") == "active"
+             for u in ["llama-chat", "llama-vision", "llama-embed", "openclaw-gateway"])
+    if ok:
+        return ("🟢 **@matthias-chatbot is ONLINE** — feel free to write to me!\n"
+                "(DMs open for everyone; owner commands only for @23thecoolbear45)\n"
+                f"*(Indicator, as of {datetime.datetime.now().strftime('%H:%M')})*")
+    return ("🔴 **@matthias-chatbot is OFFLINE** (Gateway/model restart — back soon!)")
+
+def find_poster_message(channel, marker):
+    """letzte Poster-Nachricht finden (enthält marker)"""
+    msgs = curl_json(f"/channels/{channel}/messages?limit=30")
+    if isinstance(msgs, list):
+        for m in msgs:
+            if marker in (m.get("content") or ""):
+                return m["id"]
+    return None
+
+def get_state():
+    try: return json.load(open(STATE))
+    except Exception: return {}
+
+def set_state(d): json.dump(d, open(STATE, "w"))
+
+def main():
+    ch = resolve_channels()
+    st = get_state()
+    now = datetime.datetime.now()
+
+    # ---- 1) #stats-private: Ein Board, EDITED ----
+    if ch["stats_private"]:
+        board = board_text()
+        mid = st.get("board_msg")
+        if not mid:
+            mid = find_poster_message(ch["stats_private"], "timmy Status-Board")
+        if mid:
+            r = curl_json(f"/channels/{ch['stats_private']}/messages/{mid}", "PATCH", {"content": board})
+            if isinstance(r, dict) and r.get("id"): st.setdefault("board_msg", mid)
+            else: mid = None
+        if not mid:
+            r = curl_json(f"/channels/{ch['stats_private']}/messages", "POST", {"content": board})
+            if isinstance(r, dict) and r.get("id"):
+                st["board_msg"] = r["id"]
+
+    # ---- 2) #stats public: auch eine Message die EDITED wiederverwendet ----
+    if ch["stats"]:
+        pub = public_text()
+        mid = st.get("public_msg")
+        if not mid:
+            mid = find_poster_message(ch["stats"], "matthias-chatbot ist")
+        if mid:
+            r = curl_json(f"/channels/{ch['stats']}/messages/{mid}", "PATCH", {"content": pub})
+            if not (isinstance(r, dict) and r.get("id")): mid = None
+        if not mid:
+            r = curl_json(f"/channels/{ch['stats']}/messages", "POST", {"content": pub})
+            if isinstance(r, dict) and r.get("id"):
+                st["public_msg"] = r["id"]
+
+    # ---- 3) #logs: Fehler-Auszug, edit letzte Log-Nachricht wenn <30 min alt ----
+    if ch["logs"]:
+        errs = sh(f"journalctl --user -u openclaw-gateway -u llama-chat -u llama-vision -u llama-embed "
+                  f"--since '30 minutes ago' --no-pager | grep -iaE 'error|failed|4014|invalid' | tail -5")
+        body = errs if errs else f"(letzte 30 Min: keine Fehler) ✓ — {now.strftime('%H:%M')}"
+        log_text = f"🧾 **Logs {now.strftime('%d.%m %H:%M')}**\n```\n{body[:1800]}\n```"
+        mid = st.get("log_msg")
+        fresh = time.time() - st.get("log_ts", 0) < 1800
+        if mid and fresh:
+            r = curl_json(f"/channels/{ch['logs']}/messages/{mid}", "PATCH", {"content": log_text})
+            if isinstance(r, dict) and r.get("id"):
+                st["log_ts"] = time.time()
+            else:
+                mid = None
+        if not mid:
+            r = curl_json(f"/channels/{ch['logs']}/messages", "POST", {"content": log_text})
+            if isinstance(r, dict) and r.get("id"):
+                st["log_msg"] = r["id"]; st["log_ts"] = time.time()
+
+    set_state(st)
+
+if __name__ == "__main__":
+    main()

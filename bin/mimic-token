@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""mimic-token - Tokens automatisch holen, speichern und verwalten.
+
+Bekannte Dienste: spotify (OAuth + Capture) — weitere per capture_token('name').
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.expanduser("~/.local/share/mimic"))
+
+from tokenstore import TokenError, _cli  # noqa: E402
+
+if __name__ == "__main__":
+    try:
+        sys.exit(_cli(sys.argv))
+    except TokenError as e:
+        print(f"Fehler: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

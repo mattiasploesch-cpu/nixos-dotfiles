@@ -1,0 +1,14 @@
+#!/run/current-system/sw/bin/env bash
+set -euo pipefail
+
+nix-shell -p android-tools lz4 cpio --run '
+  img="$1"
+  name="$2"
+  mkdir -p "$name"
+  unpack_bootimg --boot_img "$img" --out "$name"
+  if [ -s "$name/ramdisk" ]; then
+    mkdir -p "$name/ramdisk_extracted"
+    lz4 -dc "$name/ramdisk" | (cd "$name/ramdisk_extracted" && cpio -idm --no-absolute-filenames)
+  fi
+  echo "Extracted: $img -> $name"
+' _ "$1" "$2"
